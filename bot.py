@@ -72,6 +72,6 @@ while True:
         except Exception as e:
             print(f"开空仓失败: {e}")
 
-    time.sleep(60)  # 每 1 分钟检查一次
+    time.sleep(300)  # 每 5分钟检查一次
 运行交易机器人
 if name == "main": trading_bot()
