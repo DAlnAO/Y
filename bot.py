@@ -184,7 +184,7 @@ def trading_bot():
 
         except Exception as e:
             logging.error(f"⚠️ 交易循环错误: {e}")
-            time.sleep(10)
+            time.sleep(60)
 
 # **✅ 启动机器人**
 trading_bot()
