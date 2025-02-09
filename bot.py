@@ -2,14 +2,12 @@ import os
 import ccxt
 import pandas as pd
 import numpy as np
-import requests
-from bs4 import BeautifulSoup
-from textblob import TextBlob
 import time
 import logging
 import tensorflow as tf
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense
+from sklearn.model_selection import train_test_split
 
 # ✅ 日志系统
 logging.basicConfig(filename='trading_bot.log', level=logging.INFO, format='%(asctime)s - %(message)s')
@@ -39,29 +37,6 @@ if not os.path.exists(data_file):
 
 if not os.path.exists(trade_history_file):
     pd.DataFrame(columns=["timestamp", "symbol", "action", "size", "price"]).to_csv(trade_history_file, index=False)
-
-# ✅ 获取市场新闻
-def fetch_market_news():
-    url = "https://www.coindesk.com/"
-    headers = {"User-Agent": "Mozilla/5.0"}
-    try:
-        response = requests.get(url, headers=headers)
-        soup = BeautifulSoup(response.text, "html.parser")
-        news_list = [{"title": article.get_text().strip()} for article in soup.find_all("a", class_="headline")[:5]]
-        logging.info(f"📰 成功获取市场新闻: {news_list[:3]}")
-        return news_list
-    except Exception as e:
-        logging.error(f"⚠️ 获取市场新闻失败: {e}")
-        return []
-
-def analyze_news_sentiment(news_list):
-    return sum(TextBlob(news["title"]).sentiment.polarity for news in news_list) / len(news_list) if news_list else 0
-
-def get_news_sentiment_signal():
-    score = analyze_news_sentiment(fetch_market_news())
-    signal = "bullish" if score > 0.3 else "bearish" if score < -0.3 else "neutral"
-    logging.info(f"📊 新闻情绪信号: {signal}")
-    return signal
 
 # ✅ 获取市场数据
 def get_market_data(symbol, timeframe='5m', limit=500):
@@ -93,8 +68,15 @@ def train_lstm():
             logging.warning("⚠️ 训练数据不足，LSTM 训练跳过")
             return None
 
-        X = df[['ma5', 'ma15', 'rsi', 'macd', 'atr', 'obv', 'price_change']].values.reshape(-1, 7, 1)
+        X = df[['ma5', 'ma15', 'rsi', 'macd', 'atr', 'obv', 'price_change']].values
         y = df['signal'].values
+
+        # 划分训练集和测试集
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=True)
+
+        # 重新调整 LSTM 输入形状
+        X_train = X_train.reshape(-1, 7, 1)
+        X_test = X_test.reshape(-1, 7, 1)
 
         model = Sequential([
             LSTM(50, return_sequences=True, input_shape=(7,1)),
@@ -102,9 +84,10 @@ def train_lstm():
             Dense(1, activation='sigmoid')
         ])
         model.compile(loss='binary_crossentropy', optimizer='adam', metrics=['accuracy'])
-        model.fit(X, y, epochs=10, batch_size=16, verbose=0)
 
+        history = model.fit(X_train, y_train, validation_data=(X_test, y_test), epochs=50, batch_size=16, verbose=1)
         logging.info("✅ LSTM 训练完成")
+
         return model
     except Exception as e:
         logging.error(f"⚠️ LSTM 训练失败: {e}")
@@ -121,7 +104,6 @@ def get_trade_signal(symbol):
         logging.warning(f"⚠️ {symbol} 交易信号计算失败: 数据不足 7 行")
         return "hold"
 
-    news_signal = get_news_sentiment_signal()
     features = df[['ma5', 'ma15', 'rsi', 'macd', 'atr', 'obv', 'price_change']].values[-7:]
     
     if lstm_model:
@@ -130,10 +112,8 @@ def get_trade_signal(symbol):
     else:
         lstm_signal = np.random.choice(["buy", "sell", "hold"])
 
-    signal = "buy" if lstm_signal == "buy" and news_signal == "bullish" else "sell" if lstm_signal == "sell" and news_signal == "bearish" else "hold"
-    
-    logging.info(f"📢 交易信号: {signal} (LSTM: {lstm_signal}, 新闻: {news_signal})")
-    return signal
+    logging.info(f"📢 交易信号: {lstm_signal} (LSTM 预测)")
+    return lstm_signal
 
 def execute_trade(symbol, action, size):
     for _ in range(3):
