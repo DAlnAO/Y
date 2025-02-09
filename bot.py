@@ -9,9 +9,6 @@ from bs4 import BeautifulSoup
 from textblob import TextBlob
 import time
 import logging
-from stable_baselines3 import DQN
-import gym
-from gym import spaces
 
 # **日志系统**
 logging.basicConfig(filename='trading_bot.log', level=logging.INFO, format='%(asctime)s - %(message)s')
@@ -29,16 +26,6 @@ def get_market_data(symbol='ETH-USDT-SWAP', timeframe='15m', limit=500):
     ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
     df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-    return df
-
-# **添加技术指标**
-def add_technical_indicators(df):
-    df['ma5'] = talib.SMA(df['close'], timeperiod=5)
-    df['ma15'] = talib.SMA(df['close'], timeperiod=15)
-    df['ma50'] = talib.SMA(df['close'], timeperiod=50)
-    df['rsi'] = talib.RSI(df['close'], timeperiod=14)
-    df['atr'] = talib.ATR(df['high'], df['low'], df['close'], timeperiod=14)
-    df['macd'], df['macd_signal'], _ = talib.MACD(df['close'], fastperiod=12, slowperiod=26, signalperiod=9)
     return df
 
 # **查询账户 USDT 余额**
@@ -59,7 +46,7 @@ def get_position(symbol):
                     "unrealized_pnl": pos['unrealizedPnl']
                 }
     except Exception as e:
-        print(f"⚠️ 获取持仓失败: {e}")
+        logging.error(f"⚠️ 获取持仓失败: {e}")
     return None
 
 # **获取市场新闻**
@@ -98,56 +85,15 @@ def get_news_sentiment_signal():
     else:
         return "neutral"
 
-# **交易环境（强化学习）**
-class TradingEnv(gym.Env):
-    def __init__(self, symbol='ETH-USDT-SWAP', timeframe='15m', lookback=50):
-        super(TradingEnv, self).__init__()
-
-        self.exchange = exchange
-        self.symbol = symbol
-        self.timeframe = timeframe
-        self.lookback = lookback
-        self.data = self.get_market_data()
-        self.current_step = lookback
-        self.balance = 10000
-        self.position = 0
-
-        self.action_space = spaces.Discrete(3)
-        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(lookback, 5), dtype=np.float32)
-
-    def get_market_data(self):
-        df = get_market_data(self.symbol, self.timeframe, limit=1000)
-        return df
-
-    def step(self, action):
-        prev_price = self.data.iloc[self.current_step - 1]['close']
-        current_price = self.data.iloc[self.current_step]['close']
-
-        if action == 0 and self.position == 0:
-            self.position = self.balance / current_price
-            self.balance = 0
-        elif action == 1 and self.position > 0:
-            self.balance = self.position * current_price
-            self.position = 0
-
-        new_balance = self.balance + (self.position * current_price)
-        reward = new_balance - self.balance
-        self.current_step += 1
-        done = self.current_step >= len(self.data) - 1
-        obs = self.data.iloc[self.current_step - self.lookback:self.current_step].values
-
-        return obs.reshape(1, -1), reward, done, {}
-
-    def reset(self):
-        self.current_step = self.lookback
-        self.balance = 10000
-        self.position = 0
-        return self.data.iloc[self.current_step - self.lookback:self.current_step].values.reshape(1, -1)
-
 # **训练 XGBoost 模型**
 def train_xgboost():
     df = get_market_data('ETH-USDT-SWAP', '15m', 500)
-    df = add_technical_indicators(df)
+    df['ma5'] = talib.SMA(df['close'], timeperiod=5)
+    df['ma15'] = talib.SMA(df['close'], timeperiod=15)
+    df['ma50'] = talib.SMA(df['close'], timeperiod=50)
+    df['rsi'] = talib.RSI(df['close'], timeperiod=14)
+    df['atr'] = talib.ATR(df['high'], df['low'], df['close'], timeperiod=14)
+    df['macd'], df['macd_signal'], _ = talib.MACD(df['close'], fastperiod=12, slowperiod=26, signalperiod=9)
     
     X = df[['ma5', 'ma15', 'ma50', 'rsi', 'atr', 'macd']]
     y = (df['close'].shift(-1) > df['close']).astype(int)
@@ -162,7 +108,12 @@ model_xgb = train_xgboost()
 # **获取交易信号**
 def get_trade_signal():
     df = get_market_data('ETH-USDT-SWAP', '15m', 500)
-    df = add_technical_indicators(df)
+    df['ma5'] = talib.SMA(df['close'], timeperiod=5)
+    df['ma15'] = talib.SMA(df['close'], timeperiod=15)
+    df['ma50'] = talib.SMA(df['close'], timeperiod=50)
+    df['rsi'] = talib.RSI(df['close'], timeperiod=14)
+    df['atr'] = talib.ATR(df['high'], df['low'], df['close'], timeperiod=14)
+    df['macd'], df['macd_signal'], _ = talib.MACD(df['close'], fastperiod=12, slowperiod=26, signalperiod=9)
 
     X = df[['ma5', 'ma15', 'ma50', 'rsi', 'atr', 'macd']]
     short_term_signal = model_xgb.predict(X[-1:])[0]
@@ -176,22 +127,40 @@ def get_trade_signal():
     else:
         return "hold"
 
+# **执行交易**
+def execute_trade(symbol, action, size):
+    try:
+        exchange.create_market_order(symbol, action, size)
+        logging.info(f"✅ 交易执行: {action.upper()} {size} 张 {symbol}")
+    except Exception as e:
+        logging.error(f"⚠️ 交易执行失败: {e}")
+
 # **交易机器人**
 def trading_bot(symbol='ETH-USDT-SWAP'):
     while True:
-        usdt_balance = get_balance()
-        position = get_position(symbol)
+        try:
+            usdt_balance = get_balance()
+            position = get_position(symbol)
 
-        print(f"💰 账户 USDT 余额: {usdt_balance}")
-        if position:
-            print(f"📊 持仓: {position['side']} {position['size']} 张, 开仓价: {position['entry_price']}, 盈亏: {position['unrealized_pnl']}")
-        else:
-            print("📭 无持仓")
+            logging.info(f"💰 账户 USDT 余额: {usdt_balance}")
+            if position:
+                logging.info(f"📊 持仓: {position['side']} {position['size']} 张, 开仓价: {position['entry_price']}, 盈亏: {position['unrealized_pnl']}")
+            else:
+                logging.info("📭 无持仓")
 
-        signal = get_trade_signal()
-        print(f"📢 交易信号: {signal}")
+            signal = get_trade_signal()
+            logging.info(f"📢 交易信号: {signal}")
 
-        time.sleep(60)
+            if signal == "buy" and not position:
+                execute_trade(symbol, "buy", 10)
+            elif signal == "sell" and not position:
+                execute_trade(symbol, "sell", 10)
+
+            time.sleep(60)
+
+        except Exception as e:
+            logging.error(f"⚠️ 交易循环错误: {e}")
+            time.sleep(10)
 
 # **启动机器人**
 trading_bot()
