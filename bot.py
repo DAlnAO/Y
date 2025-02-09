@@ -130,11 +130,11 @@ def execute_trade(symbol, action, size):
 
 # **✅ 交易机器人**
 def trading_bot():
-    initial_balance = 10000
+    initial_balance 
 
     while True:
         try:
-            usdt_balance = 10000
+            usdt_balance 
             for symbol in symbols:
                 if symbol in last_trade_time and time.time() - last_trade_time[symbol] < cooldown_period:
                     continue
