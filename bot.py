@@ -15,8 +15,8 @@ logging.basicConfig(filename='trading_bot.log', level=logging.INFO, format='%(as
 
 # **OKX API 配置**
 exchange = ccxt.okx({
-    'apiKey': "你的API_KEY",
-    'secret': "你的API_SECRET",
+    'apiKey': "0f046e6a-1627-4db4-b97d-083d7e6cc16b",
+    'secret': "BF7BC880C73AD54D2528FA271A358C2C",
     'password': "你的API_PASSPHRASE",
     'options': {'defaultType': 'swap'},
 })
