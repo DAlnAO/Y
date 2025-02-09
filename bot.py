@@ -1,88 +1,157 @@
 import ccxt
-import time
+import pandas as pd
 import numpy as np
+import talib
+import xgboost as xgb
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout
+from stable_baselines3 import DQN
+import gym
+from gym import spaces
+import time
+import logging
 
-# OKX API 配置（请替换为你的 API Key）
-API_KEY = "0f046e6a-1627-4db4-b97d-083d7e6cc16b"
-API_SECRET = "BF7BC880C73AD54D2528FA271A358C2C"
-API_PASSPHRASE = "Duan0918."
+# **日志系统**
+logging.basicConfig(filename='trading_bot.log', level=logging.INFO, format='%(asctime)s - %(message)s')
 
-# 初始化 OKX 交易所（支持合约交易）
+# **OKX API 配置**
 exchange = ccxt.okx({
-    'apiKey': API_KEY,
-    'secret': API_SECRET,
-    'password': API_PASSPHRASE,
-    'options': {'defaultType': 'swap'},  # 永续合约模式
+    'apiKey': "你的API_KEY",
+    'secret': "你的API_SECRET",
+    'password': "你的API_PASSPHRASE",
+    'options': {'defaultType': 'swap'},
 })
 
+# **数据采集**
+def get_market_data(symbol='ETH-USDT-SWAP', timeframe='15m', limit=500):
+    ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+    df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+    return df
 
-# 获取账户余额（用于计算仓位）
-def get_balance():
-    balance = exchange.fetch_balance()
-    usdt_balance = balance['total']['USDT']
-    print(f"💰 账户 USDT 余额: {usdt_balance}")
-    return usdt_balance
+# **添加技术指标**
+def add_technical_indicators(df):
+    df['ma5'] = talib.SMA(df['close'], timeperiod=5)
+    df['ma15'] = talib.SMA(df['close'], timeperiod=15)
+    df['ma50'] = talib.SMA(df['close'], timeperiod=50)
+    df['rsi'] = talib.RSI(df['close'], timeperiod=14)
+    df['atr'] = talib.ATR(df['high'], df['low'], df['close'], timeperiod=14)
+    df['macd'], df['macd_signal'], _ = talib.MACD(df['close'], fastperiod=12, slowperiod=26, signalperiod=9)
+    return df
 
+# **交易环境（强化学习）**
+class TradingEnv(gym.Env):
+    def __init__(self, symbol='ETH-USDT-SWAP', timeframe='15m', lookback=50):
+        super(TradingEnv, self).__init__()
 
-# 计算合适的杠杆（基于账户余额）
-def select_leverage(balance):
-    """根据账户余额自动选择杠杆"""
-    if balance > 5000:
-        return 3  # 资金大，使用低杠杆
-    elif balance > 1000:
-        return 5  # 资金中等，使用中等杠杆
+        self.exchange = exchange
+        self.symbol = symbol
+        self.timeframe = timeframe
+        self.lookback = lookback
+        self.data = self.get_market_data()
+        self.current_step = lookback
+        self.balance = 10000
+        self.position = 0
+
+        self.action_space = spaces.Discrete(3)
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(lookback, 5), dtype=np.float32)
+
+    def get_market_data(self):
+        df = get_market_data(self.symbol, self.timeframe, limit=1000)
+        return df
+
+    def step(self, action):
+        prev_price = self.data.iloc[self.current_step - 1]['close']
+        current_price = self.data.iloc[self.current_step]['close']
+
+        if action == 0 and self.position == 0:
+            self.position = self.balance / current_price
+            self.balance = 0
+        elif action == 1 and self.position > 0:
+            self.balance = self.position * current_price
+            self.position = 0
+
+        new_balance = self.balance + (self.position * current_price)
+        reward = new_balance - self.balance
+        self.current_step += 1
+        done = self.current_step >= len(self.data) - 1
+        obs = self.data.iloc[self.current_step - self.lookback:self.current_step].values
+
+        return obs, reward, done, {}
+
+    def reset(self):
+        self.current_step = self.lookback
+        self.balance = 10000
+        self.position = 0
+        return self.data.iloc[self.current_step - self.lookback:self.current_step].values
+
+# **训练 DQN 强化学习 Agent**
+def train_rl_model():
+    env = TradingEnv()
+    model = DQN("MlpPolicy", env, verbose=1)
+    model.learn(total_timesteps=100000)
+    model.save("dqn_trading_model")
+
+# **加载训练好的 DQN 模型**
+model_dqn = DQN.load("dqn_trading_model")
+
+# **获取交易信号**
+def get_trade_signal():
+    df = get_market_data('ETH-USDT-SWAP', '15m', 500)
+    df = add_technical_indicators(df)
+
+    # 机器学习预测
+    X = df[['ma5', 'ma15', 'ma50', 'rsi', 'atr', 'macd']]
+    xgb_model = xgb.XGBClassifier()
+    xgb_model.fit(X[:-1], (df['close'].shift(-1) > df['close'])[:-1].astype(int))
+    short_term_signal = xgb_model.predict(X[-1:])[0]
+
+    # 强化学习决策
+    env = TradingEnv()
+    obs = env.reset()
+    rl_action, _ = model_dqn.predict(obs)
+
+    # 综合信号
+    if short_term_signal == 1 and rl_action == 0:
+        return "buy"
+    elif short_term_signal == 0 and rl_action == 1:
+        return "sell"
     else:
-        return 10  # 资金小，使用高杠杆
+        return "hold"
 
-
-# 设置逐仓模式 & 自动杠杆
-def set_margin_mode(symbol, balance):
-    """ 设置逐仓模式并调整杠杆 """
-    leverage = select_leverage(balance)
-    params = {
+# **交易执行**
+def place_order(symbol, side, size):
+    order = {
         "instId": symbol,
-        "lever": str(leverage),
-        "mgnMode": "isolated"  # 逐仓模式
+        "tdMode": "isolated",
+        "side": side,
+        "ordType": "market",
+        "sz": str(size),
     }
     try:
-        exchange.private_post_account_set_leverage(params)
-        print(f"✅ 已设置 {symbol} 为逐仓模式，杠杆: {leverage}x")
+        exchange.private_post_trade_order(order)
+        print(f"✅ {side.upper()} {symbol} x {size}")
     except Exception as e:
-        print(f"⚠️ 设置杠杆失败: {e}")
+        print(f"⚠️ 下单失败: {e}")
 
-    return leverage  # 需要保证 return 在 try-except 语句块之外
-
-
-# 计算仓位大小（使用账户总仓位的 10%）
-def calculate_position_size(balance, leverage):
-    position_size = (balance * 0.1) * leverage  # 10% 余额 & 杠杆
-    return round(position_size, 2)
-
-
-# 获取市场数据（K线）
-def get_market_data(symbol='ETH-USDT-SWAP', timeframe='15m', limit=50):
-    ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
-    closes = np.array([candle[4] for candle in ohlcv])  # 提取收盘价
-    return closes
-
-
-# 计算均线（用于趋势判断）
-def moving_average(data, window=10):
-    if len(data) < window:
-        return None
-    return np.mean(data[-window:])
-
-
-# 交易逻辑（结合多时间框架 + 逐仓模式）
+# **实盘交易机器人**
 def trading_bot(symbol='ETH-USDT-SWAP'):
-    usdt_balance = get_balance()
-    leverage = set_margin_mode(symbol, usdt_balance)  # 自动选择杠杆
-    position_size = calculate_position_size(usdt_balance, leverage)
+    balance = exchange.fetch_balance()['total']['USDT']
+    position_size = round(balance * 0.1, 2)
 
     while True:
-        # 获取多时间框架均线
-        ma5m = moving_average(get_market_data(symbol, '5m'), 10)
-        ma15m = moving_average(get_market_data(symbol, '15m'), 10)
-        ma1h = moving_average(get_market_data(symbol, '1h'), 10)
-        ma4h = moving_average(get_market_data(symbol, '4h'), 10)
-        latest_price = get_market_data(symbol, '5m')[-1]  # 5分钟
+        signal = get_trade_signal()
+        position = get_position(symbol)
+
+        if signal == "buy" and not position:
+            place_order(symbol, "buy", position_size)
+        elif signal == "sell" and not position:
+            place_order(symbol, "sell", position_size)
+        elif position and signal == "hold":
+            close_position(symbol)
+
+        time.sleep(10)
+
+# **启动 AI 交易机器人**
+trading_bot()
