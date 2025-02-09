@@ -48,8 +48,10 @@ def fetch_market_news():
         response = requests.get(url, headers=headers)
         soup = BeautifulSoup(response.text, "html.parser")
         news_list = [{"title": article.get_text().strip()} for article in soup.find_all("a", class_="headline")[:5]]
+        logging.info(f"📰 成功获取市场新闻: {news_list[:3]}")
         return news_list
-    except:
+    except Exception as e:
+        logging.error(f"⚠️ 获取市场新闻失败: {e}")
         return []
 
 def analyze_news_sentiment(news_list):
@@ -57,7 +59,9 @@ def analyze_news_sentiment(news_list):
 
 def get_news_sentiment_signal():
     score = analyze_news_sentiment(fetch_market_news())
-    return "bullish" if score > 0.3 else "bearish" if score < -0.3 else "neutral"
+    signal = "bullish" if score > 0.3 else "bearish" if score < -0.3 else "neutral"
+    logging.info(f"📊 新闻情绪信号: {signal}")
+    return signal
 
 # ✅ 获取市场数据
 def get_market_data(symbol, timeframe='5m', limit=500):
@@ -75,11 +79,7 @@ def get_market_data(symbol, timeframe='5m', limit=500):
         df['price_change'] = df['close'].pct_change()
 
         df = df.dropna()
-        
-        if len(df) < 7:
-            logging.warning(f"⚠️ {symbol} 数据不足 7 行，无法计算交易信号")
-            return None
-
+        logging.info(f"📊 获取 {symbol} 市场数据成功，最新价格: {df['close'].iloc[-1]}")
         return df
     except Exception as e:
         logging.error(f"⚠️ 获取市场数据失败: {e}")
@@ -122,8 +122,8 @@ def get_trade_signal(symbol):
         return "hold"
 
     news_signal = get_news_sentiment_signal()
-
     features = df[['ma5', 'ma15', 'rsi', 'macd', 'atr', 'obv', 'price_change']].values[-7:]
+    
     if lstm_model:
         lstm_prediction = lstm_model.predict(features.reshape(1, 7, 1))[0][0]
         lstm_signal = "buy" if lstm_prediction > 0.5 else "sell"
@@ -131,20 +131,26 @@ def get_trade_signal(symbol):
         lstm_signal = np.random.choice(["buy", "sell", "hold"])
 
     signal = "buy" if lstm_signal == "buy" and news_signal == "bullish" else "sell" if lstm_signal == "sell" and news_signal == "bearish" else "hold"
+    
+    logging.info(f"📢 交易信号: {signal} (LSTM: {lstm_signal}, 新闻: {news_signal})")
     return signal
 
 def execute_trade(symbol, action, size):
     for _ in range(3):
         try:
             exchange.create_market_order(symbol, action, size)
+            logging.info(f"✅ 交易成功: {action.upper()} {size} 张 {symbol}")
             last_trade_time[symbol] = time.time()
             return
-        except:
+        except Exception as e:
+            logging.error(f"⚠️ 交易失败: {e}")
             time.sleep(2)
 
 # ✅ 交易机器人
 def trading_bot():
+    logging.info("🚀 交易机器人启动...")
     initial_balance = 10000
+    
     while True:
         try:
             usdt_balance = 10000
@@ -160,9 +166,11 @@ def trading_bot():
             if ((usdt_balance - initial_balance) / initial_balance) * 100 <= -max_drawdown:
                 break
 
+            logging.info(f"💰 每 1 分钟记录 USDT 余额: {usdt_balance}")
             time.sleep(60)
 
-        except:
+        except Exception as e:
+            logging.error(f"⚠️ 交易循环错误: {e}")
             time.sleep(60)
 
 trading_bot()
