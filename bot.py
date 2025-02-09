@@ -2,17 +2,20 @@ import os
 import ccxt
 import pandas as pd
 import numpy as np
-import xgboost as xgb
 import requests
 from bs4 import BeautifulSoup
 from textblob import TextBlob
 import time
 import logging
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense
 
-# **日志系统**
+# **✅ 日志系统**
 logging.basicConfig(filename='trading_bot.log', level=logging.INFO, format='%(asctime)s - %(message)s')
 
-# **OKX API 配置**
+# **✅ OKX API 配置**
 exchange = ccxt.okx({
     'apiKey': "0f046e6a-1627-4db4-b97d-083d7e6cc16b",
     'secret': "BF7BC880C73AD54D2528FA271A358C2C",
@@ -20,18 +23,23 @@ exchange = ccxt.okx({
     'options': {'defaultType': 'swap'},
 })
 
-# **参数设置**
-target_profit = 3  # 止盈 3%（更快锁定利润）
-max_loss = 2  # 止损 2%（减少回撤）
-risk_percentage = 15  # 资金管理：每次交易使用账户余额的 15%
-max_risk = 30  # 最高资金使用率 30%
-max_drawdown = 20  # 最大亏损 20% 后停止交易
-data_file = "trading_data.csv"  # 存储交易数据
-symbols = ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP"]  # 多币种支持
+# **✅ 交易参数**
+target_profit = 3  
+max_loss = 2  
+risk_percentage = 10  
+max_risk = 30  
+max_drawdown = 15  
+cooldown_period = 600  # 10 分钟交易冷却时间
+data_file = "trading_data.csv"
+trade_history_file = "trade_history.csv"
+symbols = ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP"]
 
 # **✅ 确保数据文件存在**
 if not os.path.exists(data_file):
-    pd.DataFrame(columns=["timestamp", "symbol", "close", "ma3", "ma10", "rsi", "macd", "atr", "bollinger_upper", "bollinger_lower", "price_change", "signal"]).to_csv(data_file, index=False)
+    pd.DataFrame(columns=["timestamp", "symbol", "close", "ma5", "ma15", "rsi", "macd", "atr", "obv", "price_change", "signal"]).to_csv(data_file, index=False)
+
+if not os.path.exists(trade_history_file):
+    pd.DataFrame(columns=["timestamp", "symbol", "action", "size", "price"]).to_csv(trade_history_file, index=False)
 
 # **✅ 获取市场新闻**
 def fetch_market_news():
@@ -40,40 +48,17 @@ def fetch_market_news():
     try:
         response = requests.get(url, headers=headers)
         soup = BeautifulSoup(response.text, "html.parser")
-
-        news_list = []
-        for article in soup.find_all("a", class_="headline"):
-            title = article.get_text().strip()
-            link = article["href"]
-            news_list.append({"title": title, "link": link})
-
-        logging.info(f"📰 成功获取市场新闻: {news_list[:3]}")
-        return news_list[:5]
-    except Exception as e:
-        logging.error(f"⚠️ 获取市场新闻失败: {e}")
+        news_list = [{"title": article.get_text().strip()} for article in soup.find_all("a", class_="headline")[:5]]
+        return news_list
+    except:
         return []
 
-# **✅ 计算新闻情绪**
 def analyze_news_sentiment(news_list):
-    if not news_list:
-        return 0  # 如果无法获取新闻，默认情绪为中性
+    return sum(TextBlob(news["title"]).sentiment.polarity for news in news_list) / len(news_list) if news_list else 0
 
-    sentiment_score = sum(TextBlob(news["title"]).sentiment.polarity for news in news_list)
-    score = sentiment_score / len(news_list)
-    logging.info(f"📊 新闻情绪得分: {score}")
-    return score
-
-# **✅ 获取新闻情绪信号**
 def get_news_sentiment_signal():
-    news_list = fetch_market_news()
-    sentiment_score = analyze_news_sentiment(news_list)
-
-    if sentiment_score > 0.3:
-        return "bullish"
-    elif sentiment_score < -0.3:
-        return "bearish"
-    else:
-        return "neutral"
+    score = analyze_news_sentiment(fetch_market_news())
+    return "bullish" if score > 0.3 else "bearish" if score < -0.3 else "neutral"
 
 # **✅ 获取市场数据**
 def get_market_data(symbol, timeframe='5m', limit=500):
@@ -82,62 +67,91 @@ def get_market_data(symbol, timeframe='5m', limit=500):
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
 
-        # 计算技术指标
-        df['ma3'] = df['close'].rolling(window=3).mean()
-        df['ma10'] = df['close'].rolling(window=10).mean()
-        df['rsi'] = 100 - (100 / (1 + df['close'].pct_change().rolling(7).mean()))
+        df['ma5'] = df['close'].rolling(window=5).mean()
+        df['ma15'] = df['close'].rolling(window=15).mean()
+        df['rsi'] = 100 - (100 / (1 + df['close'].pct_change().rolling(14).mean()))
         df['macd'] = df['close'].ewm(span=12).mean() - df['close'].ewm(span=26).mean()
         df['atr'] = df['high'].rolling(14).max() - df['low'].rolling(14).min()
-        df['bollinger_upper'] = df['close'].rolling(window=20).mean() + (df['close'].rolling(window=20).std() * 2)
-        df['bollinger_lower'] = df['close'].rolling(window=20).mean() - (df['close'].rolling(window=20).std() * 2)
+        df['obv'] = (np.sign(df['close'].diff()) * df['volume']).cumsum()
         df['price_change'] = df['close'].pct_change()
 
-        df = df.dropna()
-        logging.info(f"📊 成功获取 {symbol} 市场数据 - 最新价格: {df['close'].iloc[-1]}")
-        return df
-    except Exception as e:
-        logging.error(f"⚠️ 获取市场数据失败: {e}")
+        return df.dropna()
+    except:
         return None
 
-# **✅ 获取交易信号**
+# **✅ 训练 LSTM 模型**
+def train_lstm():
+    df = pd.read_csv(data_file)
+    if len(df) < 500:
+        return None
+
+    X = df[['ma5', 'ma15', 'rsi', 'macd', 'atr', 'obv', 'price_change']].values.reshape(-1, 7, 1)
+    y = df['signal'].values
+
+    model = Sequential([
+        LSTM(50, return_sequences=True, input_shape=(7,1)),
+        LSTM(50),
+        Dense(1, activation='sigmoid')
+    ])
+    model.compile(loss='binary_crossentropy', optimizer='adam', metrics=['accuracy'])
+    model.fit(X, y, epochs=10, batch_size=16, verbose=0)
+    
+    return model
+
+lstm_model = train_lstm()
+
+# **✅ 交易逻辑**
+last_trade_time = {}
+
 def get_trade_signal(symbol):
     df = get_market_data(symbol)
     if df is None:
         return "hold"
 
     news_signal = get_news_sentiment_signal()
-    short_term_signal = np.random.choice(["buy", "sell", "hold"])  # 增强交易活跃度（模拟 XGBoost）
+    features = df[['ma5', 'ma15', 'rsi', 'macd', 'atr', 'obv', 'price_change']].values[-7:].reshape(1, 7, 1)
+    lstm_signal = "buy" if lstm_model.predict(features)[0][0] > 0.5 else "sell"
 
-    signal = "buy" if short_term_signal == "buy" and news_signal == "bullish" else "sell" if short_term_signal == "sell" and news_signal == "bearish" else "hold"
+    signal = "buy" if lstm_signal == "buy" and news_signal == "bullish" else "sell" if lstm_signal == "sell" and news_signal == "bearish" else "hold"
 
-    logging.info(f"📢 交易信号: {signal} (技术: {short_term_signal}, 新闻: {news_signal})")
     return signal
+
+def execute_trade(symbol, action, size):
+    for _ in range(3):
+        try:
+            exchange.create_market_order(symbol, action, size)
+            trade_log = pd.DataFrame([{"timestamp": time.time(), "symbol": symbol, "action": action, "size": size}])
+            trade_log.to_csv(trade_history_file, mode="a", header=False, index=False)
+            last_trade_time[symbol] = time.time()
+            return
+        except:
+            time.sleep(2)
+    return
 
 # **✅ 交易机器人**
 def trading_bot():
-    logging.info("🚀 交易机器人启动...")
-    initial_balance = 10000  # 模拟账户余额
+    initial_balance = 10000
 
     while True:
         try:
-            usdt_balance = 10000  # 模拟账户余额
-            logging.info(f"🔄 轮询市场中... 账户余额: {usdt_balance} USDT")
-
+            usdt_balance = 10000
             for symbol in symbols:
+                if symbol in last_trade_time and time.time() - last_trade_time[symbol] < cooldown_period:
+                    continue
+
                 signal = get_trade_signal(symbol)
                 if signal in ["buy", "sell"]:
                     trade_size = round((usdt_balance * (risk_percentage / 100)), 2)
                     if trade_size > (usdt_balance * (max_risk / 100)):
                         trade_size = round((usdt_balance * (max_risk / 100)), 2)
-                    logging.info(f"✅ 模拟交易: {signal.upper()} {trade_size} 张 {symbol}")
+                    execute_trade(symbol, signal, trade_size)
 
-            # **✅ 每 1 分钟记录一次日志**
-            logging.info(f"💰 每 1 分钟反馈账户 USDT 余额: {usdt_balance}")
+            if ((usdt_balance - initial_balance) / initial_balance) * 100 <= -max_drawdown:
+                break
+
             time.sleep(60)
 
-        except Exception as e:
-            logging.error(f"⚠️ 交易循环错误: {e}")
+        except:
             time.sleep(60)
 
-# **✅ 启动机器人**
 trading_bot()
