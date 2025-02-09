@@ -178,13 +178,13 @@ def trading_bot():
                 logging.warning("⚠️ 账户亏损超出最大限制，停止交易！")
                 break
 
-            # **✅ 每分钟记录一次日志**
-            logging.info(f"💰 每分钟反馈账户 USDT 余额: {usdt_balance}")
-            time.sleep(60)
+            # **✅ 每 2 分钟记录一次日志**
+            logging.info(f"💰 每 2 分钟反馈账户 USDT 余额: {usdt_balance}")
+            time.sleep(120)
 
         except Exception as e:
             logging.error(f"⚠️ 交易循环错误: {e}")
-            time.sleep(60)
+            time.sleep(120)
 
 # **✅ 启动机器人**
 trading_bot()
