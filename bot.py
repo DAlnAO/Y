@@ -1,6 +1,6 @@
 import ccxt import time import numpy as np
 
-OKX API 配置（请替换为你的 API Key）
+OKX API 配置
 API_KEY = "0f046e6a-1627-4db4-b97d-083d7e6cc16b" API_SECRET = "BF7BC880C73AD54D2528FA271A358C2C" API_PASSPHRASE = "Duan0918."
 
 初始化 OKX 交易所（支持合约交易）
