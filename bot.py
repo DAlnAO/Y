@@ -26,17 +26,28 @@ max_loss = 3  # 止损 3%
 risk_percentage = 10  # 资金管理：每次交易使用账户余额的 10%
 max_drawdown = 20  # 最大亏损 20% 后停止交易
 data_file = "trading_data.csv"  # 存储交易数据
+symbols = ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP"]  # 多币种支持
 
 # **✅ 确保数据文件存在**
 if not os.path.exists(data_file):
-    pd.DataFrame(columns=["timestamp", "close", "ma5", "ma15", "price_change", "signal"]).to_csv(data_file, index=False)
+    pd.DataFrame(columns=["timestamp", "symbol", "close", "ma5", "ma15", "rsi", "macd", "atr", "price_change", "signal"]).to_csv(data_file, index=False)
 
 # **✅ 获取市场数据**
-def get_market_data(symbol='ETH-USDT-SWAP', timeframe='15m', limit=500):
+def get_market_data(symbol, timeframe='15m', limit=500):
     try:
         ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+
+        # 计算技术指标
+        df['ma5'] = df['close'].rolling(window=5).mean()
+        df['ma15'] = df['close'].rolling(window=15).mean()
+        df['rsi'] = 100 - (100 / (1 + df['close'].pct_change().rolling(14).mean()))
+        df['macd'] = df['close'].ewm(span=12).mean() - df['close'].ewm(span=26).mean()
+        df['atr'] = df['high'].rolling(14).max() - df['low'].rolling(14).min()
+        df['price_change'] = df['close'].pct_change()
+
+        df = df.dropna()  # 去除 NaN
         logging.info(f"📊 成功获取 {symbol} 市场数据 - 最新价格: {df['close'].iloc[-1]}")
         return df
     except Exception as e:
@@ -89,11 +100,11 @@ def get_news_sentiment_signal():
 def train_xgboost():
     try:
         df = pd.read_csv(data_file)
-        if len(df) < 20:
+        if len(df) < 50:
             logging.error("⚠️ XGBoost 训练失败：数据不足")
             return None
 
-        X = df[['ma5', 'ma15', 'price_change']]
+        X = df[['ma5', 'ma15', 'rsi', 'macd', 'atr', 'price_change']]
         y = df['signal']
 
         model_xgb = xgb.XGBClassifier()
@@ -107,23 +118,19 @@ def train_xgboost():
 model_xgb = train_xgboost()
 
 # **✅ 获取交易信号**
-def get_trade_signal():
-    df = get_market_data('ETH-USDT-SWAP', '15m', 500)
+def get_trade_signal(symbol):
+    df = get_market_data(symbol)
     if df is None:
         return "hold"
 
-    df['ma5'] = df['close'].rolling(window=5).mean()
-    df['ma15'] = df['close'].rolling(window=15).mean()
-    df['price_change'] = df['close'].pct_change()
-    df = df.dropna()
+    latest_data = df.iloc[-1][['timestamp', 'close', 'ma5', 'ma15', 'rsi', 'macd', 'atr', 'price_change']].to_dict()
 
-    latest_data = df.iloc[-1][['timestamp', 'close', 'ma5', 'ma15', 'price_change']].to_dict()
-
+    short_term_signal = 0 if model_xgb is None else model_xgb.predict(df[['ma5', 'ma15', 'rsi', 'macd', 'atr', 'price_change']][-1:])[0]
     news_signal = get_news_sentiment_signal()
-    short_term_signal = 0 if model_xgb is None else model_xgb.predict(df[['ma5', 'ma15', 'price_change']][-1:])[0]
 
     signal = "buy" if short_term_signal == 1 and news_signal == "bullish" else "sell" if short_term_signal == 0 and news_signal == "bearish" else "hold"
 
+    latest_data["symbol"] = symbol
     latest_data["signal"] = 1 if signal == "buy" else 0 if signal == "sell" else -1
     pd.DataFrame([latest_data]).to_csv(data_file, mode='a', header=False, index=False)
 
@@ -150,7 +157,7 @@ def execute_trade(symbol, action, size):
         logging.error(f"⚠️ 交易执行失败: {e}")
 
 # **✅ 交易机器人**
-def trading_bot(symbol='ETH-USDT-SWAP'):
+def trading_bot():
     logging.info("🚀 交易机器人启动...")
     initial_balance = get_balance()
 
@@ -159,17 +166,21 @@ def trading_bot(symbol='ETH-USDT-SWAP'):
             usdt_balance = get_balance()
             logging.info(f"🔄 轮询市场中... 账户余额: {usdt_balance} USDT")
 
-            # **✅ 获取交易信号**
-            signal = get_trade_signal()
-            logging.info(f"📢 交易信号: {signal}")
+            for symbol in symbols:
+                signal = get_trade_signal(symbol)
+                if signal in ["buy", "sell"]:
+                    trade_size = round((usdt_balance * (risk_percentage / 100)), 2)
+                    execute_trade(symbol, signal, trade_size)
 
-            if signal in ["buy", "sell"]:
-                trade_size = round((usdt_balance * (risk_percentage / 100)), 2)
-                execute_trade(symbol, signal, trade_size)
+            # **✅ 账户风险管理**
+            drawdown = ((usdt_balance - initial_balance) / initial_balance) * 100
+            if drawdown <= -max_drawdown:
+                logging.warning("⚠️ 账户亏损超出最大限制，停止交易！")
+                break
 
-            # **✅ 每 30 秒反馈账户 USDT 余额**
-            logging.info(f"💰 每 30 秒反馈账户 USDT 余额: {usdt_balance}")
-            time.sleep(30)
+            # **✅ 每分钟记录一次日志**
+            logging.info(f"💰 每分钟反馈账户 USDT 余额: {usdt_balance}")
+            time.sleep(60)
 
         except Exception as e:
             logging.error(f"⚠️ 交易循环错误: {e}")
