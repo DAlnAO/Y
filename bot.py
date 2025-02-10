@@ -1,4 +1,7 @@
 import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "-1"  # 禁用 GPU
+import tensorflow as tf
+
 import ccxt
 import pandas as pd
 import numpy as np
@@ -129,3 +132,6 @@ def trading_bot():
         except Exception as e:
             logging.error(f"⚠️ 交易循环错误: {e}")
             time.sleep(trading_frequency)
+
+# ✅ 启动交易机器人
+trading_bot()
