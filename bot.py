@@ -6,7 +6,9 @@ import time
 import logging
 import tensorflow as tf
 from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense
+from tensorflow.keras.layers import LSTM, Dense, Dropout
+from tensorflow.keras.callbacks import EarlyStopping
+from stable_baselines3 import SAC, PPO, DDPG
 from sklearn.model_selection import train_test_split
 
 # ✅ 日志系统
@@ -21,22 +23,21 @@ exchange = ccxt.okx({
 })
 
 # ✅ 交易参数
-target_profit = 3  
-max_loss = 2  
-risk_percentage = 10  
-max_risk = 30  
-max_drawdown = 15  
-cooldown_period = 600  # 10 分钟交易冷却时间
-data_file = "trading_data.csv"
+seq_length = 10
+base_risk_percentage = 10
+max_drawdown = 15
+cooldown_period = 600
+min_leverage = 5
+max_leverage = 50
 trade_history_file = "trade_history.csv"
+model_path_sac = "sac_trading_model.zip"
+model_path_ppo = "ppo_trading_model.zip"
+model_path_ddpg = "ddpg_trading_model.zip"
 symbols = ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP"]
 
 # ✅ 确保数据文件存在
-if not os.path.exists(data_file):
-    pd.DataFrame(columns=["timestamp", "symbol", "close", "ma5", "ma15", "rsi", "macd", "atr", "obv", "price_change", "signal"]).to_csv(data_file, index=False)
-
 if not os.path.exists(trade_history_file):
-    pd.DataFrame(columns=["timestamp", "symbol", "action", "size", "price"]).to_csv(trade_history_file, index=False)
+    pd.DataFrame(columns=["timestamp", "symbol", "action", "size", "price", "pnl"]).to_csv(trade_history_file, index=False)
 
 # ✅ 获取市场数据
 def get_market_data(symbol, timeframe='5m', limit=500):
@@ -51,106 +52,116 @@ def get_market_data(symbol, timeframe='5m', limit=500):
         df['macd'] = df['close'].ewm(span=12).mean() - df['close'].ewm(span=26).mean()
         df['atr'] = df['high'].rolling(14).max() - df['low'].rolling(14).min()
         df['obv'] = (np.sign(df['close'].diff()) * df['volume']).cumsum()
-        df['price_change'] = df['close'].pct_change()
 
         df = df.dropna()
-        logging.info(f"📊 获取 {symbol} 市场数据成功，最新价格: {df['close'].iloc[-1]}")
         return df
     except Exception as e:
         logging.error(f"⚠️ 获取市场数据失败: {e}")
         return None
 
-# ✅ 训练 LSTM 模型
-def train_lstm():
-    try:
-        df = pd.read_csv(data_file, on_bad_lines='skip')
-        if len(df) < 500:
-            logging.warning("⚠️ 训练数据不足，LSTM 训练跳过")
-            return None
-
-        X = df[['ma5', 'ma15', 'rsi', 'macd', 'atr', 'obv', 'price_change']].values
-        y = df['signal'].values
-
-        # 划分训练集和测试集
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=True)
-
-        # 重新调整 LSTM 输入形状
-        X_train = X_train.reshape(-1, 7, 1)
-        X_test = X_test.reshape(-1, 7, 1)
-
-        model = Sequential([
-            LSTM(50, return_sequences=True, input_shape=(7,1)),
-            LSTM(50),
-            Dense(1, activation='sigmoid')
-        ])
-        model.compile(loss='binary_crossentropy', optimizer='adam', metrics=['accuracy'])
-
-        history = model.fit(X_train, y_train, validation_data=(X_test, y_test), epochs=50, batch_size=16, verbose=1)
-        logging.info("✅ LSTM 训练完成")
-
-        return model
-    except Exception as e:
-        logging.error(f"⚠️ LSTM 训练失败: {e}")
+# ✅ 强化学习模型训练
+def train_rl_model(model_type="SAC"):
+    df = pd.read_csv(trade_history_file)
+    if len(df) < 500:
+        logging.warning("⚠️ 训练数据不足，强化学习模型跳过")
         return None
 
-lstm_model = train_lstm()
+    env_data = df[['price', 'pnl']].values
+    env_data = env_data / np.max(np.abs(env_data), axis=0)  # 归一化数据
 
-# ✅ 交易逻辑
-last_trade_time = {}
+    if model_type == "SAC":
+        model = SAC("MlpPolicy", env_data, verbose=1)
+        model.learn(total_timesteps=20000)
+        model.save(model_path_sac)
+    elif model_type == "PPO":
+        model = PPO("MlpPolicy", env_data, verbose=1)
+        model.learn(total_timesteps=20000)
+        model.save(model_path_ppo)
+    elif model_type == "DDPG":
+        model = DDPG("MlpPolicy", env_data, verbose=1)
+        model.learn(total_timesteps=20000)
+        model.save(model_path_ddpg)
+    
+    return model
 
+# ✅ 加载/训练强化学习交易模型
+if os.path.exists(model_path_sac):
+    sac_model = SAC.load(model_path_sac)
+else:
+    sac_model = train_rl_model("SAC")
+
+if os.path.exists(model_path_ppo):
+    ppo_model = PPO.load(model_path_ppo)
+else:
+    ppo_model = train_rl_model("PPO")
+
+if os.path.exists(model_path_ddpg):
+    ddpg_model = DDPG.load(model_path_ddpg)
+else:
+    ddpg_model = train_rl_model("DDPG")
+
+# ✅ 智能杠杆计算
+def get_dynamic_leverage(symbol):
+    df = get_market_data(symbol)
+    if df is None or len(df) < 20:
+        return min_leverage
+
+    atr = df['atr'].rolling(20).mean().iloc[-1]
+    volatility = atr / df['close'].iloc[-1]
+
+    leverage = np.clip(int(50 - volatility * 5000), min_leverage, max_leverage)
+
+    logging.info(f"🔄 智能杠杆: {symbol} | 波动率: {volatility:.4f} | 杠杆: {leverage}x")
+    return leverage
+
+# ✅ 交易信号获取（SAC + PPO + DDPG）
 def get_trade_signal(symbol):
     df = get_market_data(symbol)
-    if df is None or len(df) < 7:
-        logging.warning(f"⚠️ {symbol} 交易信号计算失败: 数据不足 7 行")
-        return "hold"
+    if df is None or len(df) < seq_length:
+        return "hold", 0, 0
 
-    features = df[['ma5', 'ma15', 'rsi', 'macd', 'atr', 'obv', 'price_change']].values[-7:]
-    
-    if lstm_model:
-        lstm_prediction = lstm_model.predict(features.reshape(1, 7, 1))[0][0]
-        lstm_signal = "buy" if lstm_prediction > 0.5 else "sell"
+    features = df[['ma5', 'ma15', 'rsi', 'macd', 'atr', 'obv']].values[-seq_length:]
+    atr = df['atr'].iloc[-1]
+
+    if np.random.rand() < 0.33:
+        model = sac_model
+    elif np.random.rand() < 0.66:
+        model = ppo_model
     else:
-        lstm_signal = np.random.choice(["buy", "sell", "hold"])
+        model = ddpg_model
 
-    logging.info(f"📢 交易信号: {lstm_signal} (LSTM 预测)")
-    return lstm_signal
-
-def execute_trade(symbol, action, size):
-    for _ in range(3):
-        try:
-            exchange.create_market_order(symbol, action, size)
-            logging.info(f"✅ 交易成功: {action.upper()} {size} 张 {symbol}")
-            last_trade_time[symbol] = time.time()
-            return
-        except Exception as e:
-            logging.error(f"⚠️ 交易失败: {e}")
-            time.sleep(2)
+    action, _states = model.predict(features.reshape(1, seq_length, 6))
+    if action == 0:
+        return "buy", df['close'].iloc[-1] - atr * 1.5, df['close'].iloc[-1] + atr * 2
+    elif action == 1:
+        return "sell", df['close'].iloc[-1] - atr * 1.5, df['close'].iloc[-1] + atr * 2
+    else:
+        return "hold", 0, 0
 
 # ✅ 交易机器人
 def trading_bot():
-    logging.info("🚀 交易机器人启动...")
-    initial_balance = 1000
+    initial_balance = exchange.fetch_balance()['total'].get('USDT', 0)
     
     while True:
         try:
-            usdt_balance = 1000
-            for symbol in symbols:
-                if symbol in last_trade_time and time.time() - last_trade_time[symbol] < cooldown_period:
-                    continue
+            balance = exchange.fetch_balance()
+            usdt_balance = balance['total'].get('USDT', 0)
 
-                signal = get_trade_signal(symbol)
+            for symbol in symbols:
+                leverage = get_dynamic_leverage(symbol)
+                signal, stop_loss, take_profit = get_trade_signal(symbol)
                 if signal in ["buy", "sell"]:
-                    trade_size = round((usdt_balance * (risk_percentage / 100)), 2)
-                    execute_trade(symbol, signal, trade_size)
+                    trade_size = round((usdt_balance * (base_risk_percentage / 100)), 2)
+                    execute_trade(symbol, signal, trade_size, stop_loss, take_profit, leverage)
 
             if ((usdt_balance - initial_balance) / initial_balance) * 100 <= -max_drawdown:
                 break
 
-            logging.info(f"💰 每 1 分钟记录 USDT 余额: {usdt_balance}")
-            time.sleep(60)
+            logging.info(f"💰 账户余额: {usdt_balance} USDT")
+            time.sleep(300)
 
         except Exception as e:
             logging.error(f"⚠️ 交易循环错误: {e}")
-            time.sleep(60)
+            time.sleep(300)
 
 trading_bot()
