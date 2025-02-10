@@ -8,6 +8,7 @@ import tensorflow as tf
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense, Dropout
 from stable_baselines3 import SAC, PPO, DDPG
+from sklearn.preprocessing import MinMaxScaler
 
 # ✅ 设置日志系统
 logging.basicConfig(filename='trading_bot.log', level=logging.INFO, format='%(asctime)s - %(message)s')
@@ -21,13 +22,13 @@ exchange = ccxt.okx({
 })
 
 # ✅ 交易参数
-base_risk_percentage = 10
+risk_percentage = 10
 max_drawdown = 15
-cooldown_period = 600
 min_leverage = 5
 max_leverage = 50
 trade_history_file = "trade_history.csv"
 symbols = ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP"]
+model_path = "trading_model.zip"
 
 # ✅ 确保交易数据文件存在
 if not os.path.exists(trade_history_file):
@@ -55,24 +56,19 @@ def get_market_data(symbol, timeframe='5m', limit=500):
         return None
 
 # ✅ 训练强化学习模型
-def train_rl_model(model_type="SAC"):
+def train_rl_model():
     df = pd.read_csv(trade_history_file)
     if len(df) < 500:
         logging.warning("⚠️ 训练数据不足，强化学习跳过")
         return None
 
     env_data = df[['price', 'pnl']].values
-    env_data = env_data / np.max(np.abs(env_data), axis=0)  # 归一化数据
+    scaler = MinMaxScaler()
+    env_data = scaler.fit_transform(env_data)
 
-    if model_type == "SAC":
-        model = SAC("MlpPolicy", env_data, verbose=1)
-        model.learn(total_timesteps=20000)
-    elif model_type == "PPO":
-        model = PPO("MlpPolicy", env_data, verbose=1)
-        model.learn(total_timesteps=20000)
-    elif model_type == "DDPG":
-        model = DDPG("MlpPolicy", env_data, verbose=1)
-        model.learn(total_timesteps=20000)
+    model = SAC("MlpPolicy", env_data, verbose=1)
+    model.learn(total_timesteps=20000)
+    model.save(model_path)
 
     return model
 
@@ -89,8 +85,8 @@ def get_dynamic_leverage(symbol):
     logging.info(f"🔄 智能杠杆: {symbol} | 波动率: {volatility:.4f} | 杠杆: {leverage}x")
     return leverage
 
-# ✅ 获取交易信号（SAC + PPO + DDPG）
-def get_trade_signal(symbol):
+# ✅ 获取交易信号
+def get_trade_signal(symbol, model):
     df = get_market_data(symbol)
     if df is None or len(df) < 10:
         return "hold", 0, 0
@@ -98,7 +94,6 @@ def get_trade_signal(symbol):
     features = df[['ma5', 'ma15', 'rsi', 'macd', 'atr', 'obv']].values[-10:]
     atr = df['atr'].iloc[-1]
 
-    model = np.random.choice([SAC, PPO, DDPG])("MlpPolicy", features, verbose=1)
     action, _states = model.predict(features.reshape(1, 10, 6))
 
     if action == 0:
@@ -119,6 +114,12 @@ def execute_trade(symbol, action, size, stop_loss, take_profit, leverage):
 # ✅ 交易机器人
 def trading_bot():
     initial_balance = exchange.fetch_balance()['total'].get('USDT', 0)
+    
+    # 加载/训练强化学习模型
+    if os.path.exists(model_path):
+        model = SAC.load(model_path)
+    else:
+        model = train_rl_model()
 
     while True:
         try:
@@ -127,9 +128,9 @@ def trading_bot():
 
             for symbol in symbols:
                 leverage = get_dynamic_leverage(symbol)
-                signal, stop_loss, take_profit = get_trade_signal(symbol)
+                signal, stop_loss, take_profit = get_trade_signal(symbol, model)
                 if signal in ["buy", "sell"]:
-                    trade_size = round((usdt_balance * (base_risk_percentage / 100)), 2)
+                    trade_size = round((usdt_balance * (risk_percentage / 100)), 2)
                     execute_trade(symbol, signal, trade_size, stop_loss, take_profit, leverage)
 
             if ((usdt_balance - initial_balance) / initial_balance) * 100 <= -max_drawdown:
