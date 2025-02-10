@@ -147,7 +147,7 @@ def get_trade_signal(symbol):
     if df is None:
         return "hold"
 
-    prediction = predict_with_ai(symbol)
+    lstm_pred, xgb_pred, arima_pred, transformer_pred, prediction = predict_with_ai(symbol)
     last_price = df['close'].iloc[-1]
 
     signal = "hold"
@@ -156,9 +156,9 @@ def get_trade_signal(symbol):
     elif prediction < last_price:
         signal = "sell"
 
-    logging.info(f"📊 交易信号: {symbol} | 现价: {last_price:.2f} | AI 预测: {prediction:.2f} | 信号: {signal.upper()}")
+    # 确保 prediction 是标量或可以被格式化的类型
+    logging.info(f"📊 交易信号: {symbol} | 现价: {last_price:.2f} | LSTM: {lstm_pred:.2f} | XGB: {xgb_pred:.2f} | ARIMA: {arima_pred:.2f} | Transformer: {transformer_pred} | AI 预测: {prediction.item():.2f} | 信号: {signal.upper()}")
     return signal
-
 # ✅ 计算动态止盈止损
 def calculate_sl_tp(symbol, entry_price):
     df = get_market_data(symbol)
