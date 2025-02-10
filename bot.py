@@ -4,12 +4,7 @@ import pandas as pd
 import numpy as np
 import time
 import logging
-import tensorflow as tf
-from tensorflow import keras
-from transformers import TFAutoModel, AutoTokenizer
-import xgboost as xgb
-from statsmodels.tsa.arima.model import ARIMA
-from stable_baselines3 import PPO, A2C, DDPG, DQN
+from stable_baselines3 import SAC
 from sklearn.preprocessing import MinMaxScaler
 
 # ✅ 统一日志文件
@@ -17,141 +12,118 @@ logging.basicConfig(filename='trading_bot.log', level=logging.INFO, format='%(as
 
 # ✅ OKX API 配置
 exchange = ccxt.okx({
-    'apiKey': "0f046e6a-1627-4db4-b97d-083d7e6cc16b",
-    'secret': "BF7BC880C73AD54D2528FA271A358C2C",
-    'password': "Duan0918.",
+    'apiKey': "你的 API Key",
+    'secret': "你的 API Secret",
+    'password': "你的 API Password",
     'options': {'defaultType': 'swap'},
 })
 
 # ✅ 交易参数
 risk_percentage = 10  
+max_drawdown = 15
 min_leverage = 5
 max_leverage = 125
+trade_history_file = "trade_history.csv"
 symbols = ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP"]
-trading_frequency = 300  # 5分钟
+training_interval = 86400  # 每 24 小时训练一次
+training_count = 0  
+consecutive_losses = 0  # 记录连续亏损次数
+trading_frequency = 300  # 初始交易频率（5分钟）
 
 # ✅ 获取市场数据
-def get_market_data(symbol, timeframe='5m', limit=500):
+def get_market_data(symbol, timeframes=['5m', '1h', '1d'], limit=500):
+    market_data = {}
     try:
-        ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
-        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-        df['atr'] = df['high'].rolling(14).max() - df['low'].rolling(14).min()
-        df['rsi'] = 100 - (100 / (1 + df['close'].pct_change().rolling(14).mean()))
-        df['macd'] = df['close'].ewm(span=12).mean() - df['close'].ewm(span=26).mean()
-        df = df.dropna()
-        return df
+        for tf in timeframes:
+            ohlcv = exchange.fetch_ohlcv(symbol, tf, limit=limit)
+            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+
+            # 计算技术指标
+            df['ma5'] = df['close'].rolling(window=5).mean()
+            df['ma15'] = df['close'].rolling(window=15).mean()
+            df['rsi'] = 100 - (100 / (1 + df['close'].pct_change().rolling(14).mean()))
+            df['macd'] = df['close'].ewm(span=12).mean() - df['close'].ewm(span=26).mean()
+            df['atr'] = df['high'].rolling(14).max() - df['low'].rolling(14).min()
+            df['obv'] = (np.sign(df['close'].diff()) * df['volume']).cumsum()
+            df['boll_upper'] = df['close'].rolling(20).mean() + (df['close'].rolling(20).std() * 2)
+            df['boll_lower'] = df['close'].rolling(20).mean() - (df['close'].rolling(20).std() * 2)
+            df['cci'] = (df['close'] - df['close'].rolling(20).mean()) / (0.015 * df['close'].rolling(20).std())
+            df['mfi'] = 100 - (100 / (1 + df['volume'].rolling(14).mean() / df['volume'].rolling(14).std()))
+            df['adx'] = df['atr'].diff().abs().rolling(14).mean()
+
+            df = df.dropna()
+            market_data[tf] = df
+        return market_data
     except Exception as e:
         logging.error(f"⚠️ 获取市场数据失败: {e}")
         return None
 
-# ✅ Transformer 预测模型（长期趋势预测）
-def build_transformer_model():
-    model = TFAutoModel.from_pretrained("ProsusAI/finbert")
-    tokenizer = AutoTokenizer.from_pretrained("ProsusAI/finbert")
-    return model, tokenizer
-
-# ✅ AI 交易策略（LSTM + Transformer + XGBoost + ARIMA + CNN）
-def predict_with_ai(symbol, timeframe='5m'):
-    df = get_market_data(symbol, timeframe)
-    if df is None:
-        return None, None, None, None, None
-
-    scaler = MinMaxScaler()
-    scaled_data = scaler.fit_transform(df['close'].values.reshape(-1,1))
-    X_test = np.array(scaled_data[-20:]).reshape(1, -1, 1)
-
-    # LSTM 预测
-    try:
-        lstm_model = keras.models.load_model(f"lstm_model_{symbol}.h5")
-        lstm_pred = lstm_model.predict(X_test)
-    except Exception as e:
-        lstm_pred = [None]
-        logging.error(f"⚠️ LSTM 模型预测失败: {e}")
-
-    # XGBoost 预测
-    try:
-        xgb_model = xgb.XGBRegressor()
-        xgb_model.load_model(f"xgb_model_{symbol}.json")
-        xgb_pred = xgb_model.predict(X_test.reshape(1, -1))
-    except Exception as e:
-        xgb_pred = [None]
-        logging.error(f"⚠️ XGBoost 模型预测失败: {e}")
-
-    # ARIMA 预测
-    try:
-        arima_model = ARIMA(df['close'], order=(5,1,0)).fit()
-        arima_pred = arima_model.forecast(steps=1)
-    except Exception as e:
-        arima_pred = [None]
-        logging.error(f"⚠️ ARIMA 模型预测失败: {e}")
-
-    # Transformer 预测（FinBERT）
-    try:
-        transformer_model, tokenizer = build_transformer_model()
-        inputs = tokenizer("Will Bitcoin go up?", return_tensors="tf")
-        transformer_pred = transformer_model(**inputs).logits
-    except Exception as e:
-        transformer_pred = [None]
-        logging.error(f"⚠️ Transformer 模型预测失败: {e}")
-
-    # 综合 AI 预测
-    final_pred = (np.nanmean([lstm_pred, xgb_pred, arima_pred]))  # Use np.nanmean to handle None values
-    return lstm_pred[0], xgb_pred[0], arima_pred[0], transformer_pred, final_pred
-
-# ✅ 获取交易信号 + 记录日志
+# ✅ 获取交易信号
 def get_trade_signal(symbol):
-    df = get_market_data(symbol)
-    if df is None:
+    data = get_market_data(symbol, timeframes=['5m', '1h', '1d'])
+    if not data:
         return "hold"
 
-    lstm_pred, xgb_pred, arima_pred, transformer_pred, prediction = predict_with_ai(symbol)
-    last_price = df['close'].iloc[-1]
+    short_term, mid_term, long_term = data['5m'], data['1h'], data['1d']
+    
+    short_signal = "buy" if short_term['ma5'].iloc[-1] > short_term['ma15'].iloc[-1] else "sell"
+    mid_signal = "buy" if mid_term['ma5'].iloc[-1] > mid_term['ma15'].iloc[-1] else "sell"
+    long_signal = "buy" if long_term['ma5'].iloc[-1] > long_term['ma15'].iloc[-1] else "sell"
 
-    signal = "hold"
-    if prediction > last_price:
-        signal = "buy"
-    elif prediction < last_price:
-        signal = "sell"
+    adx = short_term['adx'].iloc[-1]
+    cci = short_term['cci'].iloc[-1]
+    mfi = short_term['mfi'].iloc[-1]
 
-    logging.info(f"📊 交易信号: {symbol} | 现价: {last_price:.2f} | LSTM: {lstm_pred:.2f} | XGB: {xgb_pred:.2f} | ARIMA: {arima_pred:.2f} | Transformer: {transformer_pred} | AI 预测: {prediction:.2f} | 信号: {signal.upper()}")
-    return signal
+    if adx < 20 or (mfi > 80 and short_signal == "buy") or (mfi < 20 and short_signal == "sell"):
+        return "hold"
+
+    final_signal = short_signal if short_signal == mid_signal == long_signal else "hold"
+    return final_signal
 
 # ✅ 计算动态止盈止损
 def calculate_sl_tp(symbol, entry_price):
-    df = get_market_data(symbol)
+    df = get_market_data(symbol)['5m']
     atr = df['atr'].iloc[-1]
     stop_loss = entry_price - (atr * 1.5)
     take_profit = entry_price + (atr * 3)
     return stop_loss, take_profit
 
-# ✅ 执行交易 + 记录日志
+# ✅ 执行交易
 def execute_trade(symbol, action, usdt_balance):
+    global consecutive_losses
     try:
-        position_size = (usdt_balance * (risk_percentage / 100)) / min_leverage
-        stop_loss, take_profit = calculate_sl_tp(symbol, get_market_data(symbol)['close'].iloc[-1])
+        leverage = get_dynamic_leverage(symbol)
+        position_size = (usdt_balance * (risk_percentage / 100)) / leverage
+        stop_loss, take_profit = calculate_sl_tp(symbol, get_market_data(symbol)['5m']['close'].iloc[-1])
 
-        exchange.create_market_order(symbol, action, position_size)
-        logging.info(f"✅ 交易成功: {action.upper()} {position_size} 张 {symbol} | 止损: {stop_loss} | 止盈: {take_profit}")
+        exchange.set_leverage(leverage, symbol, params={"mgnMode": "isolated"})
+        order = exchange.create_market_order(symbol, action, position_size)
+        logging.info(f"✅ 交易成功: {action.upper()} {position_size} 张 {symbol} | 杠杆: {leverage}x | 止损: {stop_loss} | 止盈: {take_profit}")
+
+        consecutive_losses = 0  
     except Exception as e:
         logging.error(f"⚠️ 交易失败: {e}")
+        consecutive_losses += 1
 
-# ✅ 交易机器人（记录日志每 5 分钟）
+# ✅ 交易机器人
 def trading_bot():
-    global trading_frequency
+    global training_count, trading_frequency
+    last_training_time = time.time()
+
     while True:
         try:
             balance = exchange.fetch_balance()
             usdt_balance = balance['total'].get('USDT', 0)
-            logging.info(f"💰 账户信息: USDT 余额: {usdt_balance:.2f}")
 
             for symbol in symbols:
                 signal = get_trade_signal(symbol)
                 if signal in ["buy", "sell"]:
                     execute_trade(symbol, signal, usdt_balance)
 
-            logging.info(f"🔄 机器人运行正常，等待 {trading_frequency} 秒...")
-            time.sleep(trading_frequency)
+            logging.info(f"💰 账户余额: {usdt_balance} USDT | 交易频率: {trading_frequency} 秒")
+            time.sleep(trading_frequency) 
+        
         except Exception as e:
             logging.error(f"⚠️ 交易循环错误: {e}")
             time.sleep(trading_frequency)
