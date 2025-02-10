@@ -152,5 +152,3 @@ def trading_bot():
 
 # ✅ 启动机器人
 trading_bot()
-
-查看所有功能
