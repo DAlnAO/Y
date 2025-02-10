@@ -5,34 +5,32 @@ import numpy as np
 import time
 import logging
 from stable_baselines3 import SAC
-from sklearn.preprocessing import MinMaxScaler
 
 # ✅ 设置日志
 logging.basicConfig(filename='trading_bot.log', level=logging.INFO, format='%(asctime)s - %(message)s')
 
 # ✅ OKX API 配置
 exchange = ccxt.okx({
-    'apiKey': "0f046e6a-1627-4db4-b97d-083d7e6cc16b",
-    'secret': "BF7BC880C73AD54D2528FA271A358C2C",
-    'password': "Duan0918.",
+    'apiKey': "你的API_KEY",
+    'secret': "你的SECRET",
+    'password': "你的密码",
     'options': {'defaultType': 'swap'},
 })
 
 # ✅ 交易参数
-risk_percentage = 10  # 使用账户余额的 10% 进行交易
+risk_percentage = 10  
 max_drawdown = 15
 min_leverage = 5
 max_leverage = 125
 trade_history_file = "trade_history.csv"
 symbols = ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP"]
-model_path = "trading_model.zip"
-training_interval = 86400  # **每 24 小时重新训练**
+training_interval = 86400  
 
 # ✅ 确保交易数据文件存在
 if not os.path.exists(trade_history_file):
     pd.DataFrame(columns=["timestamp", "symbol", "action", "size", "price", "pnl"]).to_csv(trade_history_file, index=False)
 
-# ✅ 获取市场数据（支持多时间框架）
+# ✅ 获取市场数据（增加更多技术指标）
 def get_market_data(symbol, timeframes=['5m', '1h', '1d'], limit=500):
     market_data = {}
 
@@ -45,10 +43,31 @@ def get_market_data(symbol, timeframes=['5m', '1h', '1d'], limit=500):
             # 计算技术指标
             df['ma5'] = df['close'].rolling(window=5).mean()
             df['ma15'] = df['close'].rolling(window=15).mean()
-            df['rsi'] = 100 - (100 / (1 + df['close'].pct_change().rolling(14).mean()))
+
+            delta = df['close'].diff()
+            gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+            df['rsi'] = 100 - (100 / (1 + gain / loss))
+
             df['macd'] = df['close'].ewm(span=12).mean() - df['close'].ewm(span=26).mean()
+
             df['atr'] = df['high'].rolling(14).max() - df['low'].rolling(14).min()
+
             df['obv'] = (np.sign(df['close'].diff()) * df['volume']).cumsum()
+
+            df['bb_middle'] = df['close'].rolling(20).mean()
+            df['bb_upper'] = df['bb_middle'] + 2 * df['close'].rolling(20).std()
+            df['bb_lower'] = df['bb_middle'] - 2 * df['close'].rolling(20).std()
+
+            df['adx'] = abs(df['high'] - df['low']).rolling(14).mean()
+
+            df['stoch_rsi'] = (df['rsi'] - df['rsi'].rolling(14).min()) / (
+                    df['rsi'].rolling(14).max() - df['rsi'].rolling(14).min())
+
+            tp = (df['high'] + df['low'] + df['close']) / 3
+            mean_tp = tp.rolling(20).mean()
+            mean_dev = (tp - mean_tp).abs().rolling(20).mean()
+            df['cci'] = (tp - mean_tp) / (0.015 * mean_dev)
 
             df = df.dropna()
             market_data[tf] = df
@@ -58,52 +77,48 @@ def get_market_data(symbol, timeframes=['5m', '1h', '1d'], limit=500):
         logging.error(f"⚠️ 获取市场数据失败: {e}")
         return None
 
-# ✅ 计算智能杠杆
-def get_dynamic_leverage(symbol):
-    df = get_market_data(symbol)
-    if df is None or len(df['5m']) < 20:
-        return min_leverage
-
-    atr = df['5m']['atr'].rolling(20).mean().iloc[-1]
-    volatility = atr / df['5m']['close'].iloc[-1]
-    leverage = int(np.clip((30 - volatility * 3000), min_leverage, max_leverage))
-
-    logging.info(f"🔄 智能杠杆: {symbol} | 波动率: {volatility:.4f} | 设定杠杆: {leverage}x")
-    return leverage
-
-# ✅ 计算持仓大小
-def calculate_position_size(symbol, usdt_balance, leverage):
-    price = get_market_data(symbol)['5m']['close'].iloc[-1]
-    risk_allocation = usdt_balance * (risk_percentage / 100)
-    position_size = (risk_allocation * leverage) / price
-
-    logging.info(f"💰 计算持仓: {symbol} | 账户余额: {usdt_balance} USDT | 交易张数: {round(position_size, 3)}")
-    return round(position_size, 3)
-
-# ✅ 获取交易信号（多时间框架）
+# ✅ 计算交易信号
 def get_trade_signal(symbol):
     data = get_market_data(symbol, timeframes=['5m', '1h', '1d'])
     if not data:
         return "hold"
 
-    short_term = data['5m']
-    mid_term = data['1h']
-    long_term = data['1d']
+    short_term, mid_term, long_term = data['5m'], data['1h'], data['1d']
 
-    short_signal = "buy" if short_term['ma5'].iloc[-1] > short_term['ma15'].iloc[-1] else "sell"
-    mid_signal = "buy" if mid_term['ma5'].iloc[-1] > mid_term['ma15'].iloc[-1] else "sell"
-    long_signal = "buy" if long_term['ma5'].iloc[-1] > long_term['ma15'].iloc[-1] else "sell"
+    def calculate_signal(df):
+        buy_votes, sell_votes = 0, 0
 
-    if short_signal == mid_signal == long_signal:
-        return short_signal
-    elif short_signal == mid_signal:
-        return "hold"
-    elif short_signal == long_signal:
-        return short_signal
+        if df['ma5'].iloc[-1] > df['ma15'].iloc[-1]: buy_votes += 1
+        else: sell_votes += 1
+
+        if df['rsi'].iloc[-1] < 30: buy_votes += 1
+        elif df['rsi'].iloc[-1] > 70: sell_votes += 1
+
+        if df['cci'].iloc[-1] < -100: buy_votes += 1
+        elif df['cci'].iloc[-1] > 100: sell_votes += 1
+
+        if df['stoch_rsi'].iloc[-1] < 0.2: buy_votes += 1
+        elif df['stoch_rsi'].iloc[-1] > 0.8: sell_votes += 1
+
+        if df['close'].iloc[-1] < df['bb_lower'].iloc[-1]: buy_votes += 1
+        elif df['close'].iloc[-1] > df['bb_upper'].iloc[-1]: sell_votes += 1
+
+        return buy_votes, sell_votes
+
+    short_buy, short_sell = calculate_signal(short_term)
+    mid_buy, mid_sell = calculate_signal(mid_term)
+    long_buy, long_sell = calculate_signal(long_term)
+
+    total_buy, total_sell = short_buy + mid_buy + long_buy, short_sell + mid_sell + long_sell
+
+    if total_buy >= 7:
+        return "buy"
+    elif total_sell >= 7:
+        return "sell"
     else:
         return "hold"
 
-# ✅ 执行交易
+# ✅ 交易执行（止损 + 止盈）
 def execute_trade(symbol, action, usdt_balance):
     try:
         leverage = get_dynamic_leverage(symbol)
@@ -117,13 +132,16 @@ def execute_trade(symbol, action, usdt_balance):
             logging.warning(f"⚠️ 交易失败: 账户保证金不足 | 可用: {available_margin} USDT")
             return
 
-        order = exchange.create_market_order(symbol, action, position_size)
-        logging.info(f"✅ 交易成功: {action.upper()} {position_size} 张 {symbol} | 杠杆: {leverage}x")
+        price = get_market_data(symbol)['5m']['close'].iloc[-1]
+        stop_loss, take_profit = price * 0.98, price * 1.05
+
+        exchange.create_order(symbol, "market", action, position_size, params={"stopLoss": stop_loss, "takeProfit": take_profit})
+        logging.info(f"✅ 交易成功: {action.upper()} {position_size} 张 {symbol} | 杠杆: {leverage}x | 止损: {stop_loss} | 止盈: {take_profit}")
     
     except Exception as e:
         logging.error(f"⚠️ 交易失败: {e}")
 
-# ✅ 交易机器人（每 2 分钟检查市场，每 24 小时重新训练模型）
+# ✅ 交易机器人主循环
 def trading_bot():
     last_training_time = time.time()
 
@@ -133,21 +151,11 @@ def trading_bot():
             usdt_balance = balance['total'].get('USDT', 0)
 
             for symbol in symbols:
-                leverage = get_dynamic_leverage(symbol)
                 signal = get_trade_signal(symbol)
-
                 if signal in ["buy", "sell"]:
                     execute_trade(symbol, signal, usdt_balance)
 
-            if time.time() - last_training_time > training_interval:
-                logging.info("🕒 重新训练强化学习模型...")
-                model = train_rl_model()
-                if model != "default":
-                    logging.info("✅ 新模型已成功加载并应用")
-                last_training_time = time.time()
-
-            logging.info(f"💰 账户余额: {usdt_balance} USDT")
-            time.sleep(120)  # **每 2 分钟检查市场**
+            time.sleep(120)  
         
         except Exception as e:
             logging.error(f"⚠️ 交易循环错误: {e}")
