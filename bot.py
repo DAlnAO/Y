@@ -8,10 +8,10 @@ import tensorflow as tf
 from stable_baselines3 import SAC
 from sklearn.preprocessing import MinMaxScaler
 
-# ✅ 设置日志系统
+# ✅ 日志系统
 logging.basicConfig(filename='trading_bot.log', level=logging.INFO, format='%(asctime)s - %(message)s')
 
-# ✅ OKX API 配置
+# ✅ OKX API 配置（已写入你的 API 信息）
 exchange = ccxt.okx({
     'apiKey': "0f046e6a-1627-4db4-b97d-083d7e6cc16b",
     'secret': "BF7BC880C73AD54D2528FA271A358C2C",
@@ -20,10 +20,10 @@ exchange = ccxt.okx({
 })
 
 # ✅ 交易参数
-risk_percentage = 10  # 每次交易使用账户余额的10%
-max_drawdown = 15  # 最大回撤 15% 停止交易
-min_leverage = 5  # 最小杠杆
-max_leverage = 50  # 最大杠杆
+risk_percentage = 10
+max_drawdown = 15
+min_leverage = 5
+max_leverage = 50
 trade_history_file = "trade_history.csv"
 symbols = ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP"]
 model_path = "trading_model.zip"
@@ -53,7 +53,7 @@ def get_market_data(symbol, timeframe='5m', limit=500):
         logging.error(f"⚠️ 获取市场数据失败: {e}")
         return None
 
-# ✅ 训练强化学习模型（每天自动训练一次，并保留旧数据）
+# ✅ 训练强化学习模型
 def train_rl_model():
     df = pd.read_csv(trade_history_file)
     if len(df) < 500:
@@ -64,7 +64,6 @@ def train_rl_model():
     scaler = MinMaxScaler()
     env_data = scaler.fit_transform(env_data)
 
-    # **加载之前的模型并继续训练**
     if os.path.exists(model_path):
         logging.info("🔄 继续训练现有模型...")
         model = SAC.load(model_path)
@@ -90,16 +89,6 @@ def get_dynamic_leverage(symbol):
     logging.info(f"🔄 智能杠杆: {symbol} | 波动率: {volatility:.4f} | 杠杆: {leverage}x")
     return leverage
 
-# ✅ 计算止盈止损
-def calculate_stop_loss_take_profit(entry_price, atr, action):
-    if action == "buy":
-        stop_loss = entry_price - atr * 1.5  # 止损：1.5倍 ATR
-        take_profit = entry_price + atr * 2  # 止盈：2倍 ATR
-    else:
-        stop_loss = entry_price + atr * 1.5  # 空头止损
-        take_profit = entry_price - atr * 2  # 空头止盈
-    return stop_loss, take_profit
-
 # ✅ 获取交易信号
 def get_trade_signal(symbol, model):
     df = get_market_data(symbol)
@@ -112,11 +101,9 @@ def get_trade_signal(symbol, model):
     action, _states = model.predict(features.reshape(1, 10, 6))
 
     if action == 0:
-        stop_loss, take_profit = calculate_stop_loss_take_profit(df['close'].iloc[-1], atr, "buy")
-        return "buy", stop_loss, take_profit
+        return "buy", df['close'].iloc[-1] - atr * 1.5, df['close'].iloc[-1] + atr * 2
     elif action == 1:
-        stop_loss, take_profit = calculate_stop_loss_take_profit(df['close'].iloc[-1], atr, "sell")
-        return "sell", stop_loss, take_profit
+        return "sell", df['close'].iloc[-1] - atr * 1.5, df['close'].iloc[-1] + atr * 2
     else:
         return "hold", 0, 0
 
@@ -128,22 +115,29 @@ def execute_trade(symbol, action, size, stop_loss, take_profit, leverage):
     except Exception as e:
         logging.error(f"⚠️ 交易失败: {e}")
 
-# ✅ 交易机器人（**每天自动训练并更新强化学习模型**）
+# ✅ 交易机器人
 def trading_bot():
     initial_balance = exchange.fetch_balance()['total'].get('USDT', 0)
     
+    # 加载/训练强化学习模型
+    if os.path.exists(model_path):
+        model = SAC.load(model_path)
+    else:
+        model = train_rl_model()
+
+    if model is None:
+        logging.error("⚠️ 由于数据不足，无法训练模型！等待数据累积...")
+        return  
+
     while True:
         try:
-            # **每 24 小时重新训练强化学习模型**
-            logging.info("🕒 重新训练强化学习模型...")
-            model = train_rl_model()
-
             balance = exchange.fetch_balance()
             usdt_balance = balance['total'].get('USDT', 0)
 
             for symbol in symbols:
                 leverage = get_dynamic_leverage(symbol)
                 signal, stop_loss, take_profit = get_trade_signal(symbol, model)
+
                 if signal in ["buy", "sell"]:
                     trade_size = round((usdt_balance * (risk_percentage / 100)), 2)
                     execute_trade(symbol, signal, trade_size, stop_loss, take_profit, leverage)
@@ -152,9 +146,7 @@ def trading_bot():
                 break
 
             logging.info(f"💰 账户余额: {usdt_balance} USDT")
-            
-            # **等待 24 小时（86400 秒），然后重新训练**
-            time.sleep(86400)
+            time.sleep(86400)  # 每 24 小时重新训练
 
         except Exception as e:
             logging.error(f"⚠️ 交易循环错误: {e}")
