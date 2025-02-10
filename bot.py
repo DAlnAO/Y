@@ -19,13 +19,16 @@ exchange = ccxt.okx({
 })
 
 # ✅ 交易参数
-risk_percentage = 10  # **每次交易使用账户余额的 10%**
+risk_percentage = 10  # 只使用 10% 账户余额交易
 max_drawdown = 15
 min_leverage = 5
-max_leverage = 125  # **修正：OKX 最大支持 125 倍杠杆**
+max_leverage = 125
 trade_history_file = "trade_history.csv"
 symbols = ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP"]
 model_path = "trading_model.zip"
+training_interval = 86400  # **每 24 小时重新训练**
+cooldown_base = 120  # **基础冷却时间 120 秒**
+last_trade_time = {symbol: 0 for symbol in symbols}  # **记录上次交易时间**
 
 # ✅ 确保交易数据文件存在
 if not os.path.exists(trade_history_file):
@@ -51,7 +54,30 @@ def get_market_data(symbol, timeframe='5m', limit=500):
         logging.error(f"⚠️ 获取市场数据失败: {e}")
         return None
 
-# ✅ 计算智能杠杆（确保 1~125 倍杠杆）
+# ✅ 训练强化学习模型
+def train_rl_model():
+    df = pd.read_csv(trade_history_file)
+    
+    if len(df) < 500:
+        logging.warning(f"⚠️ 训练数据不足 ({len(df)}/500)，强化学习跳过，使用默认策略")
+        return "default"
+
+    logging.info("🔄 开始训练强化学习模型...")
+    start_time = time.time()
+    
+    env_data = df[['price', 'pnl']].values
+    scaler = MinMaxScaler()
+    env_data = scaler.fit_transform(env_data)
+
+    model = SAC("MlpPolicy", env_data, verbose=1)
+    model.learn(total_timesteps=20000)
+    model.save(model_path)
+
+    training_duration = time.time() - start_time
+    logging.info(f"✅ 强化学习模型训练完成，训练时间: {training_duration:.2f} 秒，已更新！")
+    return model
+
+# ✅ 计算智能杠杆
 def get_dynamic_leverage(symbol):
     df = get_market_data(symbol)
     if df is None or len(df) < 20:
@@ -64,74 +90,88 @@ def get_dynamic_leverage(symbol):
     logging.info(f"🔄 智能杠杆: {symbol} | 波动率: {volatility:.4f} | 设定杠杆: {leverage}x")
     return leverage
 
-# ✅ 计算持仓大小（**使用账户余额的 10%**）
-def calculate_position_size(symbol, usdt_balance, leverage):
-    price = get_market_data(symbol)['close'].iloc[-1]
-    risk_allocation = usdt_balance * (risk_percentage / 100)  # **仅使用 10% 资金**
-    position_size = (risk_allocation * leverage) / price
+# ✅ 计算动态冷却时间
+def get_dynamic_cooldown(symbol):
+    df = get_market_data(symbol)
+    if df is None or len(df) < 20:
+        return cooldown_base
 
-    logging.info(f"💰 计算持仓: {symbol} | 账户余额: {usdt_balance} USDT | 使用资金: {risk_allocation} USDT | 杠杆: {leverage}x | 交易张数: {round(position_size, 3)}")
-    return round(position_size, 3)
+    atr = df['atr'].rolling(20).mean().iloc[-1]
+    volatility = atr / df['close'].iloc[-1]
+
+    cooldown = int(np.clip((cooldown_base + volatility * 5000), cooldown_base, 1800))  # **最大冷却 30 分钟**
+    logging.info(f"⏳ 交易冷却时间: {symbol} | 波动率: {volatility:.4f} | 设定冷却: {cooldown} 秒")
+    return cooldown
 
 # ✅ 获取交易信号
-def get_trade_signal(symbol):
+def get_trade_signal(symbol, model):
     df = get_market_data(symbol)
     if df is None or len(df) < 10:
         return "hold"
 
-    if df['ma5'].iloc[-1] > df['ma15'].iloc[-1]:
-        return "buy"
-    elif df['ma5'].iloc[-1] < df['ma15'].iloc[-1]:
-        return "sell"
-    return "hold"
+    if model == "default":
+        strategy = "均线策略"
+        if df['ma5'].iloc[-1] > df['ma15'].iloc[-1]:
+            return "buy", strategy
+        elif df['ma5'].iloc[-1] < df['ma15'].iloc[-1]:
+            return "sell", strategy
+        return "hold", strategy
 
-# ✅ 执行交易（**使用 10% 账户余额**）
-def execute_trade(symbol, action, usdt_balance):
-    try:
-        leverage = get_dynamic_leverage(symbol)
-        position_size = calculate_position_size(symbol, usdt_balance, leverage)
-
-        # ✅ 设置逐仓模式
-        exchange.set_leverage(leverage, symbol, params={"mgnMode": "isolated"})
-
-        balance = exchange.fetch_balance()
-        available_margin = balance['free'].get('USDT', 0)
-        if available_margin < position_size * leverage:
-            logging.warning(f"⚠️ 交易失败: 账户保证金不足 | 可用: {available_margin} USDT | 需要: {position_size * leverage} USDT")
-            return
-
-        order = exchange.create_market_order(symbol, action, position_size)
-        logging.info(f"✅ 交易成功: {action.upper()} {position_size} 张 {symbol} | 杠杆: {leverage}x")
+    strategy = "强化学习"
+    action, _states = model.predict(df[['ma5', 'ma15', 'rsi', 'macd', 'atr', 'obv']].values[-10:].reshape(1, 10, 6))
     
-    except Exception as e:
-        logging.error(f"⚠️ 交易失败: {e}")
+    if action == 0:
+        return "buy", strategy
+    elif action == 1:
+        return "sell", strategy
+    return "hold", strategy
 
-# ✅ 交易机器人（每 2 分钟检查一次市场）
+# ✅ 交易机器人
 def trading_bot():
-    initial_balance = exchange.fetch_balance()['total'].get('USDT', 0)
-    
+    last_training_time = time.time()
+
+    # **初始化模型**
+    if os.path.exists(model_path):
+        model = SAC.load(model_path)
+        logging.info("✅ 加载已有强化学习模型")
+    else:
+        model = train_rl_model()
+
     while True:
         try:
             balance = exchange.fetch_balance()
             usdt_balance = balance['total'].get('USDT', 0)
 
             for symbol in symbols:
+                current_time = time.time()
+                cooldown = get_dynamic_cooldown(symbol)
+
+                if current_time - last_trade_time[symbol] < cooldown:
+                    logging.info(f"🚫 冷却中: {symbol} | 等待 {cooldown - (current_time - last_trade_time[symbol]):.2f} 秒")
+                    continue
+
                 leverage = get_dynamic_leverage(symbol)
-                signal = get_trade_signal(symbol)
+                signal, strategy = get_trade_signal(symbol, model)
+
+                logging.info(f"📢 交易信号: {symbol} | {signal.upper()} | 由 {strategy} 生成")
 
                 if signal in ["buy", "sell"]:
-                    execute_trade(symbol, signal, usdt_balance)
+                    trade_size = round((usdt_balance * (risk_percentage / 100)), 2)
+                    exchange.set_leverage(leverage, symbol, params={"mgnMode": "isolated"})
 
-            if ((usdt_balance - initial_balance) / initial_balance) * 100 <= -max_drawdown:
-                logging.warning("⚠️ 账户亏损超过最大限制，停止交易！")
-                break
+                    try:
+                        order = exchange.create_market_order(symbol, signal, trade_size)
+                        last_trade_time[symbol] = current_time
+                        logging.info(f"✅ 交易成功: {signal.upper()} {trade_size} 张 {symbol} | 杠杆: {leverage}x")
+                    except Exception as e:
+                        logging.error(f"⚠️ 交易失败: {e}")
 
             logging.info(f"💰 账户余额: {usdt_balance} USDT")
-            time.sleep(120)  # **每 2 分钟检查一次市场**
+            time.sleep(60)  # **每分钟检查市场**
         
         except Exception as e:
             logging.error(f"⚠️ 交易循环错误: {e}")
-            time.sleep(120)
+            time.sleep(60)
 
 # ✅ 启动机器人
 trading_bot()
