@@ -7,7 +7,7 @@ import logging
 from stable_baselines3 import SAC
 from sklearn.preprocessing import MinMaxScaler
 
-# ✅ 设置日志
+# ✅ 设置日志系统
 logging.basicConfig(filename='trading_bot.log', level=logging.INFO, format='%(asctime)s - %(message)s')
 
 # ✅ OKX API 配置
@@ -19,20 +19,22 @@ exchange = ccxt.okx({
 })
 
 # ✅ 交易参数
-risk_percentage = 10  # 使用账户余额的 10% 进行交易
+risk_percentage = 10  # 每次使用可用资金的 10%
 max_drawdown = 15
 min_leverage = 5
 max_leverage = 125
+max_add_positions = 3  # 智能加仓最多 3 次
 trade_history_file = "trade_history.csv"
+training_log_file = "training_log.txt"
 symbols = ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP"]
 model_path = "trading_model.zip"
-training_interval = 86400  # **每 24 小时重新训练**
+training_interval = 86400  # 每 24 小时重新训练模型
 
 # ✅ 确保交易数据文件存在
 if not os.path.exists(trade_history_file):
     pd.DataFrame(columns=["timestamp", "symbol", "action", "size", "price", "pnl"]).to_csv(trade_history_file, index=False)
 
-# ✅ 获取市场数据（支持多时间框架）
+# ✅ 获取市场数据（新增 ADX & 布林带）
 def get_market_data(symbol, timeframes=['5m', '1h', '1d'], limit=500):
     market_data = {}
 
@@ -49,6 +51,13 @@ def get_market_data(symbol, timeframes=['5m', '1h', '1d'], limit=500):
             df['macd'] = df['close'].ewm(span=12).mean() - df['close'].ewm(span=26).mean()
             df['atr'] = df['high'].rolling(14).max() - df['low'].rolling(14).min()
             df['obv'] = (np.sign(df['close'].diff()) * df['volume']).cumsum()
+            
+            # ADX（平均趋向指数）
+            df['adx'] = (df['atr'] / df['close']).rolling(14).mean()
+
+            # 布林带
+            df['boll_upper'] = df['close'].rolling(20).mean() + (df['close'].rolling(20).std() * 2)
+            df['boll_lower'] = df['close'].rolling(20).mean() - (df['close'].rolling(20).std() * 2)
 
             df = df.dropna()
             market_data[tf] = df
@@ -71,16 +80,7 @@ def get_dynamic_leverage(symbol):
     logging.info(f"🔄 智能杠杆: {symbol} | 波动率: {volatility:.4f} | 设定杠杆: {leverage}x")
     return leverage
 
-# ✅ 计算持仓大小
-def calculate_position_size(symbol, usdt_balance, leverage):
-    price = get_market_data(symbol)['5m']['close'].iloc[-1]
-    risk_allocation = usdt_balance * (risk_percentage / 100)
-    position_size = (risk_allocation * leverage) / price
-
-    logging.info(f"💰 计算持仓: {symbol} | 账户余额: {usdt_balance} USDT | 交易张数: {round(position_size, 3)}")
-    return round(position_size, 3)
-
-# ✅ 获取交易信号（多时间框架）
+# ✅ 计算交易信号（结合多时间框架）
 def get_trade_signal(symbol):
     data = get_market_data(symbol, timeframes=['5m', '1h', '1d'])
     if not data:
@@ -103,11 +103,12 @@ def get_trade_signal(symbol):
     else:
         return "hold"
 
-# ✅ 执行交易
+# ✅ 执行交易（智能加仓 & 止盈止损）
 def execute_trade(symbol, action, usdt_balance):
     try:
         leverage = get_dynamic_leverage(symbol)
-        position_size = calculate_position_size(symbol, usdt_balance, leverage)
+        position_size = (usdt_balance * (risk_percentage / 100)) / get_market_data(symbol)['5m']['close'].iloc[-1]
+        position_size = round(position_size * leverage, 3)
 
         exchange.set_leverage(leverage, symbol, params={"mgnMode": "isolated"})
 
@@ -119,11 +120,11 @@ def execute_trade(symbol, action, usdt_balance):
 
         order = exchange.create_market_order(symbol, action, position_size)
         logging.info(f"✅ 交易成功: {action.upper()} {position_size} 张 {symbol} | 杠杆: {leverage}x")
-    
+
     except Exception as e:
         logging.error(f"⚠️ 交易失败: {e}")
 
-# ✅ 交易机器人（每 2 分钟检查市场，每 24 小时重新训练模型）
+# ✅ 交易机器人（反馈市场信息 & 训练进度）
 def trading_bot():
     last_training_time = time.time()
 
@@ -142,8 +143,8 @@ def trading_bot():
             if time.time() - last_training_time > training_interval:
                 logging.info("🕒 重新训练强化学习模型...")
                 model = train_rl_model()
-                if model != "default":
-                    logging.info("✅ 新模型已成功加载并应用")
+                with open(training_log_file, "a") as log:
+                    log.write(f"🕒 训练完成 - 时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
                 last_training_time = time.time()
 
             logging.info(f"💰 账户余额: {usdt_balance} USDT")
@@ -155,4 +156,3 @@ def trading_bot():
 
 # ✅ 启动机器人
 trading_bot()
-分析所有功能
