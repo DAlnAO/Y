@@ -7,10 +7,10 @@ import logging
 from stable_baselines3 import SAC
 from sklearn.preprocessing import MinMaxScaler
 
-# ✅ 设置日志系统
+# ✅ 设置日志
 logging.basicConfig(filename='trading_bot.log', level=logging.INFO, format='%(asctime)s - %(message)s')
 
-# ✅ OKX API 配置（逐仓模式）
+# ✅ OKX API 配置
 exchange = ccxt.okx({
     'apiKey': "0f046e6a-1627-4db4-b97d-083d7e6cc16b",
     'secret': "BF7BC880C73AD54D2528FA271A358C2C",
@@ -22,7 +22,7 @@ exchange = ccxt.okx({
 risk_percentage = 10
 max_drawdown = 15
 min_leverage = 5
-max_leverage = 20  # 最高 20x，避免超出保证金
+max_leverage = 50
 trade_history_file = "trade_history.csv"
 symbols = ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP"]
 model_path = "trading_model.zip"
@@ -31,17 +31,6 @@ model_path = "trading_model.zip"
 if not os.path.exists(trade_history_file):
     pd.DataFrame(columns=["timestamp", "symbol", "action", "size", "price", "pnl"]).to_csv(trade_history_file, index=False)
 
-# ✅ 获取账户余额
-def check_balance():
-    try:
-        balance = exchange.fetch_balance()
-        usdt_balance = balance['total'].get('USDT', 0)
-        logging.info(f"💰 当前账户 USDT 余额: {usdt_balance}")
-        return usdt_balance
-    except Exception as e:
-        logging.error(f"⚠️ 获取账户余额失败: {e}")
-        return 0
-
 # ✅ 获取市场数据
 def get_market_data(symbol, timeframe='5m', limit=500):
     try:
@@ -49,7 +38,6 @@ def get_market_data(symbol, timeframe='5m', limit=500):
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
 
-        # 计算技术指标
         df['ma5'] = df['close'].rolling(window=5).mean()
         df['ma15'] = df['close'].rolling(window=15).mean()
         df['rsi'] = 100 - (100 / (1 + df['close'].pct_change().rolling(14).mean()))
@@ -63,7 +51,7 @@ def get_market_data(symbol, timeframe='5m', limit=500):
         logging.error(f"⚠️ 获取市场数据失败: {e}")
         return None
 
-# ✅ 训练强化学习模型（如果数据不足，则使用默认均线策略）
+# ✅ 训练强化学习模型
 def train_rl_model():
     df = pd.read_csv(trade_history_file)
     
@@ -81,7 +69,7 @@ def train_rl_model():
 
     return model
 
-# ✅ 计算智能杠杆（限制最大 20x）
+# ✅ 计算智能杠杆
 def get_dynamic_leverage(symbol):
     df = get_market_data(symbol)
     if df is None or len(df) < 20:
@@ -89,24 +77,21 @@ def get_dynamic_leverage(symbol):
 
     atr = df['atr'].rolling(20).mean().iloc[-1]
     volatility = atr / df['close'].iloc[-1]
-    leverage = np.clip(int(30 - volatility * 3000), min_leverage, max_leverage)
+    leverage = int(np.clip((30 - volatility * 3000), min_leverage, max_leverage))
 
-    logging.info(f"🔄 智能杠杆: {symbol} | 波动率: {volatility:.4f} | 杠杆: {leverage}x")
+    logging.info(f"🔄 智能杠杆: {symbol} | 波动率: {volatility:.4f} | 设定杠杆: {leverage}x")
     return leverage
 
-# ✅ 计算交易金额（最多使用账户余额的 10%）
-def get_trade_size(usdt_balance, leverage):
-    min_trade = 10  # 最小交易金额 10 USDT
-    max_trade = (usdt_balance * 0.1) / leverage  # 调整杠杆后的交易金额
-    trade_size = round(max_trade, 2)
+# ✅ 计算持仓大小
+def calculate_position_size(symbol, usdt_balance, leverage):
+    price = get_market_data(symbol)['close'].iloc[-1]
+    risk_allocation = usdt_balance * (risk_percentage / 100)
+    position_size = (risk_allocation * leverage) / price
 
-    if trade_size < min_trade:
-        logging.warning(f"⚠️ 账户余额太低，最小交易金额 {min_trade} USDT")
-        return 0  # 余额过低，不进行交易
+    logging.info(f"💰 计算持仓: {symbol} | 余额: {usdt_balance} | 杠杆: {leverage}x | 交易张数: {round(position_size, 3)}")
+    return round(position_size, 3)
 
-    return trade_size
-
-# ✅ 获取交易信号（如果模型不可用，则使用均线策略）
+# ✅ 获取交易信号
 def get_trade_signal(symbol, model):
     df = get_market_data(symbol)
     if df is None or len(df) < 10:
@@ -122,20 +107,37 @@ def get_trade_signal(symbol, model):
             return "sell", df['close'].iloc[-1] - atr * 1.5, df['close'].iloc[-1] + atr * 2
 
     action, _states = model.predict(features.reshape(1, 10, 6))
-    return ("buy", df['close'].iloc[-1] - atr * 1.5, df['close'].iloc[-1] + atr * 2) if action == 0 else ("sell", df['close'].iloc[-1] - atr * 1.5, df['close'].iloc[-1] + atr * 2)
+    if action == 0:
+        return "buy", df['close'].iloc[-1] - atr * 1.5, df['close'].iloc[-1] + atr * 2
+    elif action == 1:
+        return "sell", df['close'].iloc[-1] - atr * 1.5, df['close'].iloc[-1] + atr * 2
+    else:
+        return "hold", 0, 0
 
-# ✅ 执行交易（逐仓模式）
-def execute_trade(symbol, action, size, stop_loss, take_profit, leverage):
+# ✅ 执行交易
+def execute_trade(symbol, action, usdt_balance):
     try:
-        exchange.set_margin_mode('isolated', symbol)  # 设置逐仓模式
-        order = exchange.create_market_order(symbol, action, size)
-        logging.info(f"✅ 交易成功: {action.upper()} {size} 张 {symbol} - 止损: {stop_loss}, 止盈: {take_profit}, 杠杆: {leverage}x")
+        leverage = get_dynamic_leverage(symbol)
+        position_size = calculate_position_size(symbol, usdt_balance, leverage)
+
+        exchange.set_margin_mode('isolated', symbol)
+        exchange.set_leverage(leverage, symbol)
+
+        balance = exchange.fetch_balance()
+        available_margin = balance['free'].get('USDT', 0)
+        if available_margin < position_size * leverage:
+            logging.warning(f"⚠️ 交易失败: 账户保证金不足 | 可用: {available_margin} USDT | 需要: {position_size * leverage} USDT")
+            return
+
+        order = exchange.create_market_order(symbol, action, position_size)
+        logging.info(f"✅ 交易成功: {action.upper()} {position_size} 张 {symbol} | 杠杆: {leverage}x")
+    
     except Exception as e:
         logging.error(f"⚠️ 交易失败: {e}")
 
-# ✅ 交易机器人（每 2 分钟运行一次）
+# ✅ 交易机器人
 def trading_bot():
-    initial_balance = check_balance()
+    initial_balance = exchange.fetch_balance()['total'].get('USDT', 0)
     
     if os.path.exists(model_path):
         model = SAC.load(model_path)
@@ -144,20 +146,21 @@ def trading_bot():
 
     while True:
         try:
-            usdt_balance = check_balance()
+            balance = exchange.fetch_balance()
+            usdt_balance = balance['total'].get('USDT', 0)
 
             for symbol in symbols:
                 leverage = get_dynamic_leverage(symbol)
-                trade_size = get_trade_size(usdt_balance, leverage)
                 signal, stop_loss, take_profit = get_trade_signal(symbol, model)
-
-                if trade_size > 0 and signal in ["buy", "sell"]:
-                    execute_trade(symbol, signal, trade_size, stop_loss, take_profit, leverage)
+                if signal in ["buy", "sell"]:
+                    execute_trade(symbol, signal, usdt_balance)
 
             if ((usdt_balance - initial_balance) / initial_balance) * 100 <= -max_drawdown:
                 break
 
-            time.sleep(120)  # 每 2 分钟检查市场
+            logging.info(f"💰 账户余额: {usdt_balance} USDT")
+            time.sleep(120)
+
         except Exception as e:
             logging.error(f"⚠️ 交易循环错误: {e}")
             time.sleep(120)
