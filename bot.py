@@ -90,7 +90,7 @@ def predict_with_ai(symbol, timeframe='5m'):
     try:
         transformer_model, tokenizer = build_transformer_model()
         inputs = tokenizer("Will Bitcoin go up?", return_tensors="tf")
-        transformer_pred = transformer_model(**inputs)
+        transformer_pred = transformer_model(**inputs).logits
     except Exception as e:
         transformer_pred = [None]
         logging.error(f"⚠️ Transformer 模型预测失败: {e}")
@@ -115,7 +115,6 @@ def get_trade_signal(symbol):
         signal = "sell"
 
     logging.info(f"📊 交易信号: {symbol} | 现价: {last_price:.2f} | LSTM: {lstm_pred:.2f} | XGB: {xgb_pred:.2f} | ARIMA: {arima_pred:.2f} | Transformer: {transformer_pred} | AI 预测: {prediction:.2f} | 信号: {signal.upper()}")
-
     return signal
 
 # ✅ 计算动态止盈止损
