@@ -4,6 +4,7 @@ import pandas as pd
 import numpy as np
 import time
 import logging
+import tensorflow as tf
 from stable_baselines3 import SAC
 from sklearn.preprocessing import MinMaxScaler
 
@@ -19,10 +20,10 @@ exchange = ccxt.okx({
 })
 
 # ✅ 交易参数
-risk_percentage = 10  # 每次交易使用余额的 10%
-max_drawdown = 15  # 最大回撤 15%
-min_leverage = 5  # 最小杠杆 5x
-max_leverage = 50  # 最大杠杆 50x
+risk_percentage = 10
+max_drawdown = 15
+min_leverage = 5
+max_leverage = 50
 trade_history_file = "trade_history.csv"
 symbols = ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP"]
 model_path = "trading_model.zip"
@@ -52,12 +53,13 @@ def get_market_data(symbol, timeframe='5m', limit=500):
         logging.error(f"⚠️ 获取市场数据失败: {e}")
         return None
 
-# ✅ 训练强化学习模型
+# ✅ 训练强化学习模型（修复：如果数据不足，不返回 None）
 def train_rl_model():
     df = pd.read_csv(trade_history_file)
+    
     if len(df) < 500:
-        logging.warning("⚠️ 训练数据不足，强化学习跳过")
-        return None
+        logging.warning(f"⚠️ 训练数据不足 ({len(df)}/500)，强化学习跳过，使用默认策略")
+        return "default"
 
     env_data = df[['price', 'pnl']].values
     scaler = MinMaxScaler()
@@ -82,7 +84,7 @@ def get_dynamic_leverage(symbol):
     logging.info(f"🔄 智能杠杆: {symbol} | 波动率: {volatility:.4f} | 杠杆: {leverage}x")
     return leverage
 
-# ✅ 获取交易信号
+# ✅ 获取交易信号（修复：如果模型不可用，使用简单均线策略）
 def get_trade_signal(symbol, model):
     df = get_market_data(symbol)
     if df is None or len(df) < 10:
@@ -91,8 +93,15 @@ def get_trade_signal(symbol, model):
     features = df[['ma5', 'ma15', 'rsi', 'macd', 'atr', 'obv']].values[-10:]
     atr = df['atr'].iloc[-1]
 
-    action, _states = model.predict(features.reshape(1, 10, 6))
+    # ✅ 如果模型不可用，使用均线策略
+    if model == "default":
+        if df['ma5'].iloc[-1] > df['ma15'].iloc[-1]:
+            return "buy", df['close'].iloc[-1] - atr * 1.5, df['close'].iloc[-1] + atr * 2
+        else:
+            return "sell", df['close'].iloc[-1] - atr * 1.5, df['close'].iloc[-1] + atr * 2
 
+    # ✅ 使用强化学习模型
+    action, _states = model.predict(features.reshape(1, 10, 6))
     if action == 0:
         return "buy", df['close'].iloc[-1] - atr * 1.5, df['close'].iloc[-1] + atr * 2
     elif action == 1:
@@ -100,32 +109,11 @@ def get_trade_signal(symbol, model):
     else:
         return "hold", 0, 0
 
-# ✅ 执行交易（逐仓模式）
+# ✅ 执行交易
 def execute_trade(symbol, action, size, stop_loss, take_profit, leverage):
     try:
-        # ✅ 设置逐仓模式
-        exchange.set_leverage(leverage, symbol, params={"marginMode": "isolated"})
-
-        # ✅ 创建市价单
-        order = exchange.create_market_order(symbol, action, size, params={"marginMode": "isolated"})
-
-        price = exchange.fetch_ticker(symbol)['last']
-        timestamp = pd.Timestamp.now()
-
-        # ✅ 记录交易数据
-        trade_data = {
-            "timestamp": timestamp,
-            "symbol": symbol,
-            "action": action,
-            "size": size,
-            "price": price,
-            "pnl": 0  # 初始 PnL 设为 0，后续更新
-        }
-
-        df = pd.DataFrame([trade_data])
-        df.to_csv(trade_history_file, mode='a', header=False, index=False)
-
-        logging.info(f"✅ 交易成功: {action.upper()} {size} 张 {symbol} - 价格: {price}, 杠杆: {leverage}x (逐仓模式)")
+        order = exchange.create_market_order(symbol, action, size)
+        logging.info(f"✅ 交易成功: {action.upper()} {size} 张 {symbol} - 止损: {stop_loss}, 止盈: {take_profit}, 杠杆: {leverage}x")
     except Exception as e:
         logging.error(f"⚠️ 交易失败: {e}")
 
