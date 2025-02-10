@@ -45,43 +45,101 @@ def get_market_data(symbol, timeframe='5m', limit=500):
         logging.error(f"⚠️ 获取市场数据失败: {e}")
         return None
 
-# ✅ Transformer 预测模型（长期趋势预测）
-def build_transformer_model():
-    model = TFAutoModel.from_pretrained("ProsusAI/finbert")
-    tokenizer = AutoTokenizer.from_pretrained("ProsusAI/finbert")
-    return model, tokenizer
-
-# ✅ AI 交易策略（LSTM + Transformer + XGBoost + ARIMA + CNN）
-def predict_with_ai(symbol, timeframe='5m'):
-    df = get_market_data(symbol, timeframe)
+# ✅ 自动训练 LSTM 模型（如果没有模型文件）
+def train_lstm_model(symbol):
+    df = get_market_data(symbol, '5m')
     if df is None:
-        return None, None, None, None, None
+        logging.error(f"⚠️ 无法获取数据，无法训练模型: {symbol}")
+        return None
 
     scaler = MinMaxScaler()
-    scaled_data = scaler.fit_transform(df['close'].values.reshape(-1,1))
+    scaled_data = scaler.fit_transform(df['close'].values.reshape(-1, 1))
+
+    X_train = []
+    y_train = []
+    look_back = 20
+    for i in range(look_back, len(scaled_data)-1):
+        X_train.append(scaled_data[i-look_back:i, 0])
+        y_train.append(scaled_data[i+1, 0])
+
+    X_train, y_train = np.array(X_train), np.array(y_train)
+    X_train = np.reshape(X_train, (X_train.shape[0], X_train.shape[1], 1))
+
+    model = keras.Sequential([
+        keras.layers.LSTM(50, return_sequences=True, input_shape=(X_train.shape[1], 1)),
+        keras.layers.Dropout(0.2),
+        keras.layers.LSTM(50, return_sequences=False),
+        keras.layers.Dropout(0.2),
+        keras.layers.Dense(25),
+        keras.layers.Dense(1)
+    ])
+    model.compile(optimizer='adam', loss='mean_squared_error')
+    model.fit(X_train, y_train, epochs=10, batch_size=16)
+
+    # 保存模型
+    model.save(f"lstm_model_{symbol}.h5")
+    logging.info(f"✅ LSTM 模型训练完成并保存: {symbol}")
+    return model, scaler
+
+# ✅ 自动训练 XGBoost 模型（如果没有模型文件）
+def train_xgb_model(symbol):
+    df = get_market_data(symbol, '5m')
+    if df is None:
+        logging.error(f"⚠️ 无法获取数据，无法训练模型: {symbol}")
+        return None
+
+    scaler = MinMaxScaler()
+    scaled_data = scaler.fit_transform(df['close'].values.reshape(-1, 1))
+
+    X_train = []
+    y_train = []
+    look_back = 20
+    for i in range(look_back, len(scaled_data)-1):
+        X_train.append(scaled_data[i-look_back:i, 0])
+        y_train.append(scaled_data[i+1, 0])
+
+    X_train, y_train = np.array(X_train), np.array(y_train)
+
+    xgb_model = xgb.XGBRegressor(objective='reg:squarederror', n_estimators=100)
+    xgb_model.fit(X_train, y_train)
+
+    # 保存模型
+    xgb_model.save_model(f"xgb_model_{symbol}.json")
+    logging.info(f"✅ XGBoost 模型训练完成并保存: {symbol}")
+    return xgb_model, scaler
+
+# ✅ 使用 LSTM 和 XGBoost 模型进行预测
+def predict_with_ai(symbol):
+    df = get_market_data(symbol)
+    if df is None:
+        return None
+
+    lstm_model_path = f"lstm_model_{symbol}.h5"
+    xgb_model_path = f"xgb_model_{symbol}.json"
+
+    if not os.path.exists(lstm_model_path):
+        lstm_model, scaler = train_lstm_model(symbol)
+    else:
+        lstm_model = keras.models.load_model(lstm_model_path)
+        scaler = MinMaxScaler()
+        logging.info(f"✅ LSTM 模型加载成功: {symbol}")
+
+    if not os.path.exists(xgb_model_path):
+        xgb_model, scaler = train_xgb_model(symbol)
+    else:
+        xgb_model = xgb.XGBRegressor()
+        xgb_model.load_model(xgb_model_path)
+        logging.info(f"✅ XGBoost 模型加载成功: {symbol}")
+
+    # 用模型进行预测
+    scaled_data = scaler.fit_transform(df['close'].values.reshape(-1, 1))
     X_test = np.array(scaled_data[-20:]).reshape(1, -1, 1)
 
-    # LSTM 预测
-    lstm_model = keras.models.load_model(f"lstm_model_{symbol}.h5")
     lstm_pred = lstm_model.predict(X_test)
-
-    # XGBoost 预测
-    xgb_model = xgb.XGBRegressor()
-    xgb_model.load_model(f"xgb_model_{symbol}.json")
     xgb_pred = xgb_model.predict(X_test.reshape(1, -1))
 
-    # ARIMA 预测
-    arima_model = ARIMA(df['close'], order=(5,1,0)).fit()
-    arima_pred = arima_model.forecast(steps=1)
-
-    # Transformer 预测（FinBERT）
-    transformer_model, tokenizer = build_transformer_model()
-    inputs = tokenizer("Will Bitcoin go up?", return_tensors="tf")
-    transformer_pred = transformer_model(**inputs)
-
-    # 综合 AI 预测
-    final_pred = (lstm_pred + xgb_pred + arima_pred[0]) / 3
-    return lstm_pred[0][0], xgb_pred[0], arima_pred[0], transformer_pred, final_pred
+    prediction = (lstm_pred + xgb_pred) / 2
+    return prediction
 
 # ✅ 获取交易信号 + 记录日志
 def get_trade_signal(symbol):
@@ -89,7 +147,7 @@ def get_trade_signal(symbol):
     if df is None:
         return "hold"
 
-    lstm_pred, xgb_pred, arima_pred, transformer_pred, prediction = predict_with_ai(symbol)
+    prediction = predict_with_ai(symbol)
     last_price = df['close'].iloc[-1]
 
     signal = "hold"
@@ -98,8 +156,7 @@ def get_trade_signal(symbol):
     elif prediction < last_price:
         signal = "sell"
 
-    logging.info(f"📊 交易信号: {symbol} | 现价: {last_price:.2f} | LSTM: {lstm_pred:.2f} | XGB: {xgb_pred:.2f} | ARIMA: {arima_pred:.2f} | Transformer: {transformer_pred} | AI 预测: {prediction:.2f} | 信号: {signal.upper()}")
-
+    logging.info(f"📊 交易信号: {symbol} | 现价: {last_price:.2f} | AI 预测: {prediction:.2f} | 信号: {signal.upper()}")
     return signal
 
 # ✅ 计算动态止盈止损
