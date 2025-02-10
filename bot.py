@@ -4,10 +4,11 @@ import pandas as pd
 import numpy as np
 import time
 import logging
+import talib as ta  # ADX 需要 TA-Lib
 from stable_baselines3 import SAC
 from sklearn.preprocessing import MinMaxScaler
 
-# ✅ 统一日志文件：trading_bot.log
+# ✅ 统一日志文件
 logging.basicConfig(filename='trading_bot.log', level=logging.INFO, format='%(asctime)s - %(message)s')
 
 # ✅ OKX API 配置
@@ -42,14 +43,14 @@ def get_market_data(symbol, timeframes=['5m', '1h', '1d'], limit=500):
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
 
+            # 计算技术指标
             df['ma5'] = df['close'].rolling(window=5).mean()
             df['ma15'] = df['close'].rolling(window=15).mean()
-            df['rsi'] = 100 - (100 / (1 + df['close'].pct_change().rolling(14).mean()))
-            df['macd'] = df['close'].ewm(span=12).mean() - df['close'].ewm(span=26).mean()
-            df['atr'] = df['high'].rolling(14).max() - df['low'].rolling(14).min()
-            df['obv'] = (np.sign(df['close'].diff()) * df['volume']).cumsum()
-            df['boll_upper'] = df['close'].rolling(20).mean() + (df['close'].rolling(20).std() * 2)
-            df['boll_lower'] = df['close'].rolling(20).mean() - (df['close'].rolling(20).std() * 2)
+            df['rsi'] = ta.RSI(df['close'], timeperiod=14)  # 使用 TA-Lib 计算 RSI
+            df['macd'], df['macd_signal'], _ = ta.MACD(df['close'], fastperiod=12, slowperiod=26, signalperiod=9)
+            df['atr'] = ta.ATR(df['high'], df['low'], df['close'], timeperiod=14)
+            df['adx'] = ta.ADX(df['high'], df['low'], df['close'], timeperiod=14)  # 计算 ADX
+            df['boll_upper'], df['boll_middle'], df['boll_lower'] = ta.BBANDS(df['close'], timeperiod=20)
 
             df = df.dropna()
             market_data[tf] = df
@@ -58,7 +59,7 @@ def get_market_data(symbol, timeframes=['5m', '1h', '1d'], limit=500):
         logging.error(f"⚠️ 获取市场数据失败: {e}")
         return None
 
-# ✅ 获取交易信号，并记录到 `trading_bot.log`
+# ✅ 获取交易信号，并记录到日志
 def get_trade_signal(symbol):
     data = get_market_data(symbol, timeframes=['5m', '1h', '1d'])
     if not data:
@@ -72,24 +73,58 @@ def get_trade_signal(symbol):
     mid_signal = "buy" if mid_term['ma5'].iloc[-1] > mid_term['ma15'].iloc[-1] else "sell"
     long_signal = "buy" if long_term['ma5'].iloc[-1] > long_term['ma15'].iloc[-1] else "sell"
 
+    # ✅ 允许 5m 和 1h 信号一致就交易，不必等 1d
     final_signal = "hold"
-    if short_signal == mid_signal == long_signal:
+    if short_signal == mid_signal:
         final_signal = short_signal
 
-    # ✅ 记录市场信号到 `trading_bot.log`
-    logging.info(f"📢 市场信号 | {symbol} | 短线(5m): {short_signal} | 中线(1h): {mid_signal} | 长线(1d): {long_signal} | 最终信号: {final_signal}")
+    # ✅ 过滤震荡市场（ADX < 25 不交易）
+    if short_term['adx'].iloc[-1] < 25:
+        logging.info(f"⚠️ {symbol} 市场震荡 (ADX < 25)，跳过交易")
+        return "hold"
 
+    logging.info(f"📢 市场信号 | {symbol} | 5m: {short_signal} | 1h: {mid_signal} | 1d: {long_signal} | 最终: {final_signal}")
     return final_signal
+
+# ✅ 计算智能杠杆
+def get_dynamic_leverage(symbol):
+    df = get_market_data(symbol)
+    if df is None or '5m' not in df or len(df['5m']) < 20:
+        return min_leverage
+
+    atr = df['5m']['atr'].rolling(20).mean().iloc[-1]
+    volatility = atr / df['5m']['close'].iloc[-1]
+    leverage = int(np.clip((30 - volatility * 3000), min_leverage, max_leverage))
+
+    logging.info(f"🔄 智能杠杆: {symbol} | 波动率: {volatility:.4f} | 设定杠杆: {leverage}x")
+    return leverage
+
+# ✅ 计算动态止盈止损
+def get_dynamic_stop_loss_take_profit(symbol):
+    df = get_market_data(symbol)
+    atr = df['5m']['atr'].iloc[-1]
+    adx = df['5m']['adx'].iloc[-1]
+
+    if adx > 30:
+        stop_loss = atr * 1.5
+        take_profit = atr * 3  # 趋势市场放大止盈
+    else:
+        stop_loss = atr * 1
+        take_profit = atr * 1.5  # 震荡市场缩小止盈
+
+    logging.info(f"📈 {symbol} 动态止盈: {take_profit:.2f} | 动态止损: {stop_loss:.2f}")
+    return stop_loss, take_profit
 
 # ✅ 执行交易
 def execute_trade(symbol, action, usdt_balance):
     try:
         leverage = get_dynamic_leverage(symbol)
         position_size = (usdt_balance * (risk_percentage / 100)) / leverage
+        stop_loss, take_profit = get_dynamic_stop_loss_take_profit(symbol)
 
         exchange.set_leverage(leverage, symbol, params={"mgnMode": "isolated"})
         order = exchange.create_market_order(symbol, action, position_size)
-        logging.info(f"✅ 交易成功: {action.upper()} {position_size} 张 {symbol} | 杠杆: {leverage}x")
+        logging.info(f"✅ 交易成功: {action.upper()} {position_size} 张 {symbol} | 杠杆: {leverage}x | 止盈: {take_profit} | 止损: {stop_loss}")
     
     except Exception as e:
         logging.error(f"⚠️ 交易失败: {e}")
