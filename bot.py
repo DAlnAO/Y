@@ -7,35 +7,29 @@ import logging
 import tensorflow as tf
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense, Dropout
-from tensorflow.keras.callbacks import EarlyStopping
 from stable_baselines3 import SAC, PPO, DDPG
-from sklearn.model_selection import train_test_split
 
-# ✅ 日志系统
+# ✅ 设置日志系统
 logging.basicConfig(filename='trading_bot.log', level=logging.INFO, format='%(asctime)s - %(message)s')
 
 # ✅ OKX API 配置
 exchange = ccxt.okx({
-    'apiKey': "0f046e6a-1627-4db4-b97d-083d7e6cc16b",
-    'secret': "BF7BC880C73AD54D2528FA271A358C2C",
-    'password': "Duan0918.",
+    'apiKey': "你的API_KEY",
+    'secret': "你的API_SECRET",
+    'password': "你的API_PASSPHRASE",
     'options': {'defaultType': 'swap'},
 })
 
 # ✅ 交易参数
-seq_length = 10
 base_risk_percentage = 10
 max_drawdown = 15
 cooldown_period = 600
 min_leverage = 5
 max_leverage = 50
 trade_history_file = "trade_history.csv"
-model_path_sac = "sac_trading_model.zip"
-model_path_ppo = "ppo_trading_model.zip"
-model_path_ddpg = "ddpg_trading_model.zip"
 symbols = ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP"]
 
-# ✅ 确保数据文件存在
+# ✅ 确保交易数据文件存在
 if not os.path.exists(trade_history_file):
     pd.DataFrame(columns=["timestamp", "symbol", "action", "size", "price", "pnl"]).to_csv(trade_history_file, index=False)
 
@@ -46,6 +40,7 @@ def get_market_data(symbol, timeframe='5m', limit=500):
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
 
+        # 计算技术指标
         df['ma5'] = df['close'].rolling(window=5).mean()
         df['ma15'] = df['close'].rolling(window=15).mean()
         df['rsi'] = 100 - (100 / (1 + df['close'].pct_change().rolling(14).mean()))
@@ -59,11 +54,11 @@ def get_market_data(symbol, timeframe='5m', limit=500):
         logging.error(f"⚠️ 获取市场数据失败: {e}")
         return None
 
-# ✅ 强化学习模型训练
+# ✅ 训练强化学习模型
 def train_rl_model(model_type="SAC"):
     df = pd.read_csv(trade_history_file)
     if len(df) < 500:
-        logging.warning("⚠️ 训练数据不足，强化学习模型跳过")
+        logging.warning("⚠️ 训练数据不足，强化学习跳过")
         return None
 
     env_data = df[['price', 'pnl']].values
@@ -72,35 +67,16 @@ def train_rl_model(model_type="SAC"):
     if model_type == "SAC":
         model = SAC("MlpPolicy", env_data, verbose=1)
         model.learn(total_timesteps=20000)
-        model.save(model_path_sac)
     elif model_type == "PPO":
         model = PPO("MlpPolicy", env_data, verbose=1)
         model.learn(total_timesteps=20000)
-        model.save(model_path_ppo)
     elif model_type == "DDPG":
         model = DDPG("MlpPolicy", env_data, verbose=1)
         model.learn(total_timesteps=20000)
-        model.save(model_path_ddpg)
-    
+
     return model
 
-# ✅ 加载/训练强化学习交易模型
-if os.path.exists(model_path_sac):
-    sac_model = SAC.load(model_path_sac)
-else:
-    sac_model = train_rl_model("SAC")
-
-if os.path.exists(model_path_ppo):
-    ppo_model = PPO.load(model_path_ppo)
-else:
-    ppo_model = train_rl_model("PPO")
-
-if os.path.exists(model_path_ddpg):
-    ddpg_model = DDPG.load(model_path_ddpg)
-else:
-    ddpg_model = train_rl_model("DDPG")
-
-# ✅ 智能杠杆计算
+# ✅ 计算智能杠杆
 def get_dynamic_leverage(symbol):
     df = get_market_data(symbol)
     if df is None or len(df) < 20:
@@ -108,29 +84,23 @@ def get_dynamic_leverage(symbol):
 
     atr = df['atr'].rolling(20).mean().iloc[-1]
     volatility = atr / df['close'].iloc[-1]
-
     leverage = np.clip(int(50 - volatility * 5000), min_leverage, max_leverage)
 
     logging.info(f"🔄 智能杠杆: {symbol} | 波动率: {volatility:.4f} | 杠杆: {leverage}x")
     return leverage
 
-# ✅ 交易信号获取（SAC + PPO + DDPG）
+# ✅ 获取交易信号（SAC + PPO + DDPG）
 def get_trade_signal(symbol):
     df = get_market_data(symbol)
-    if df is None or len(df) < seq_length:
+    if df is None or len(df) < 10:
         return "hold", 0, 0
 
-    features = df[['ma5', 'ma15', 'rsi', 'macd', 'atr', 'obv']].values[-seq_length:]
+    features = df[['ma5', 'ma15', 'rsi', 'macd', 'atr', 'obv']].values[-10:]
     atr = df['atr'].iloc[-1]
 
-    if np.random.rand() < 0.33:
-        model = sac_model
-    elif np.random.rand() < 0.66:
-        model = ppo_model
-    else:
-        model = ddpg_model
+    model = np.random.choice([SAC, PPO, DDPG])("MlpPolicy", features, verbose=1)
+    action, _states = model.predict(features.reshape(1, 10, 6))
 
-    action, _states = model.predict(features.reshape(1, seq_length, 6))
     if action == 0:
         return "buy", df['close'].iloc[-1] - atr * 1.5, df['close'].iloc[-1] + atr * 2
     elif action == 1:
@@ -138,10 +108,18 @@ def get_trade_signal(symbol):
     else:
         return "hold", 0, 0
 
+# ✅ 执行交易
+def execute_trade(symbol, action, size, stop_loss, take_profit, leverage):
+    try:
+        order = exchange.create_market_order(symbol, action, size)
+        logging.info(f"✅ 交易成功: {action.upper()} {size} 张 {symbol} - 止损: {stop_loss}, 止盈: {take_profit}, 杠杆: {leverage}x")
+    except Exception as e:
+        logging.error(f"⚠️ 交易失败: {e}")
+
 # ✅ 交易机器人
 def trading_bot():
     initial_balance = exchange.fetch_balance()['total'].get('USDT', 0)
-    
+
     while True:
         try:
             balance = exchange.fetch_balance()
@@ -164,4 +142,5 @@ def trading_bot():
             logging.error(f"⚠️ 交易循环错误: {e}")
             time.sleep(300)
 
+# ✅ 启动机器人
 trading_bot()
