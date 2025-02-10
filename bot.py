@@ -19,7 +19,7 @@ exchange = ccxt.okx({
 })
 
 # ✅ 交易参数
-risk_percentage = 5  # 降低交易风险，每次交易 5% 账户资金
+risk_percentage = 5  # 每次交易 5% 账户资金
 max_drawdown = 15
 min_leverage = 5
 max_leverage = 50
@@ -50,7 +50,7 @@ def get_market_data(symbol, timeframe='5m', limit=500):
         logging.error(f"⚠️ 获取市场数据失败: {e}")
         return None
 
-# ✅ 计算智能杠杆（避免爆仓）
+# ✅ 计算智能杠杆（确保范围 1-125）
 def get_dynamic_leverage(symbol):
     df = get_market_data(symbol)
     if df is None or len(df) < 20:
@@ -80,7 +80,7 @@ def train_rl_model():
 
     return model
 
-# ✅ 获取交易信号（支持强化学习 & 均线策略）
+# ✅ 获取交易信号（强化学习 & 均线策略）
 def get_trade_signal(symbol, model):
     df = get_market_data(symbol)
     if df is None or len(df) < 10:
@@ -104,7 +104,7 @@ def get_trade_signal(symbol, model):
     else:
         return "hold", 0, 0
 
-# ✅ 执行交易（支持资金检查 & 逐仓模式）
+# ✅ 执行交易（修复逐仓模式 & 资金管理）
 def execute_trade(symbol, action, size, stop_loss, take_profit, leverage):
     try:
         balance = exchange.fetch_balance()
@@ -114,6 +114,7 @@ def execute_trade(symbol, action, size, stop_loss, take_profit, leverage):
             logging.error(f"⚠️ 资金不足，跳过交易: {symbol} 需要 {size}, 账户余额 {usdt_balance}")
             return
 
+        # 确保逐仓模式
         exchange.set_margin_mode("isolated", symbol)
         exchange.set_leverage(leverage, symbol)
 
@@ -122,7 +123,7 @@ def execute_trade(symbol, action, size, stop_loss, take_profit, leverage):
     except Exception as e:
         logging.error(f"⚠️ 交易失败: {e}")
 
-# ✅ 交易机器人（智能调整交易频率，避免频繁交易）
+# ✅ 交易机器人（智能调整交易频率）
 def trading_bot():
     initial_balance = exchange.fetch_balance()['total'].get('USDT', 0)
     
