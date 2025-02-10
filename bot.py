@@ -92,6 +92,23 @@ def calculate_sl_tp(symbol, entry_price):
     logging.info(f"🛑 {symbol} 止盈止损计算: ATR={atr:.2f} | 止损={stop_loss:.2f} | 止盈={take_profit:.2f}")
     return stop_loss, take_profit
 
+# ✅ 执行交易（新增）
+def execute_trade(symbol, action, usdt_balance):
+    global consecutive_losses
+    try:
+        leverage = min_leverage  # 这里可以加入动态调整逻辑
+        position_size = (usdt_balance * (risk_percentage / 100)) / leverage
+        stop_loss, take_profit = calculate_sl_tp(symbol, get_market_data(symbol)['5m']['close'].iloc[-1])
+
+        exchange.set_leverage(leverage, symbol, params={"mgnMode": "isolated"})
+        order = exchange.create_market_order(symbol, action, position_size)
+        logging.info(f"✅ 交易成功: {action.upper()} {position_size} 张 {symbol} | 杠杆: {leverage}x | 止损: {stop_loss:.2f} | 止盈: {take_profit:.2f}")
+
+        consecutive_losses = 0  
+    except Exception as e:
+        logging.error(f"⚠️ 交易失败: {e}")
+        consecutive_losses += 1
+
 # ✅ 交易机器人 & 记录学习进度
 def trading_bot():
     global training_count, trading_frequency
