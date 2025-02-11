@@ -10,6 +10,9 @@ from collections import deque
 from datetime import datetime
 import torch
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
+from stable_baselines3.common.envs import DummyVecEnv
+from stable_baselines3.common.callbacks import CheckpointCallback
+from stable_baselines3.common.vec_env import VecNormalize
 
 # ✅ 统一日志文件
 logging.basicConfig(filename='trading_bot.log', level=logging.INFO, format='%(asctime)s - %(message)s')
@@ -146,7 +149,14 @@ def trade():
 # ✅ 获取交易信号（PPO）
 def get_trade_signal(symbol):
     try:
-        ppo_model = PPO.load(f"ppo_trading_agent_{symbol}")
+        model_file = f"ppo_trading_agent_{symbol}.zip"
+        
+        # 如果模型文件不存在，则训练一个新的模型
+        if not os.path.exists(model_file):
+            logging.info(f"⚠️ 模型文件 {model_file} 不存在，正在训练新的模型...")
+            train_model(symbol)
+        
+        ppo_model = PPO.load(model_file)
         data = get_market_data(symbol, timeframes=['5m'])
         if not data:
             logging.info(f"⚠️ 无法获取市场数据，无法生成交易信号")
@@ -171,6 +181,46 @@ def get_trade_signal(symbol):
         logging.error(f"⚠️ 获取交易信号失败: {e}")
         return "hold"
 
+# ✅ 训练模型
+def train_model(symbol):
+    # 定义自定义环境
+    class TradingEnv(gym.Env):
+        def __init__(self):
+            super(TradingEnv, self).__init__()
+            self.action_space = gym.spaces.Discrete(2)  # 只有两个动作: 买 (1) 或 卖 (0)
+            self.observation_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(4,), dtype=np.float32)
+
+        def reset(self):
+            self.current_step = 0
+            self.done = False
+            self.data = get_market_data(symbol)
+            self.state = np.array([
+                self.data['5m']['ma5'].iloc[0],
+                self.data['5m']['ma15'].iloc[0],
+                self.data['5m']['atr'].iloc[0],
+                self.data['5m']['rsi'].iloc[0]
+            ])
+            return self.state
+
+        def step(self, action):
+            self.current_step += 1
+            reward = 0  # 这里可以根据实际逻辑计算奖励
+            if self.current_step > len(self.data['5m']):
+                self.done = True
+            return self.state, reward, self.done, {}
+
+    # 环境设置
+    env = DummyVecEnv([lambda: TradingEnv()])
+    env = VecNormalize(env, norm_obs=True, norm_reward=True)
+    
+    # 训练 PPO 模型
+    model = PPO("MlpPolicy", env, verbose=1)
+    model.learn(total_timesteps=10000)
+    
+    # 保存模型
+    model.save(f"ppo_trading_agent_{symbol}")
+    logging.info(f"✅ 模型 {symbol} 训练完成并保存")
+    
 # ✅ 启动交易与训练
 if __name__ == "__main__":
     while True:
