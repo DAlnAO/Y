@@ -19,7 +19,7 @@ exchange = ccxt.okx({
     'apiKey': "bc6173d6-075f-4234-8fec-4b180d477381",
     'secret': "73C9792F1CD74CEA67964AE01E8A306A",
     'password': "Duan0918.",
-    'options': {'defaultType': 'swap'},
+   sandboxMode': True  # ✅ 启用模拟交易模式
 })
 
 # ✅ 定义交易对
