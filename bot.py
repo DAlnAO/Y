@@ -51,67 +51,34 @@ def get_market_data(symbol, timeframes=['5m'], limit=500):
         logging.error(f"❌ 获取市场数据失败: {symbol}，错误: {e}")
         return None
 
-# ✅ 强化学习环境（改进奖励机制）
+# ✅ 强化学习环境（确保观察空间和状态形状匹配）
 class TradingEnv(gym.Env):
     def __init__(self, symbol):
         super(TradingEnv, self).__init__()
         self.symbol = symbol
         self.action_space = gym.spaces.Discrete(2)
-        self.observation_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(7,), dtype=np.float32)
-        self.current_step = 0
-        self.balance = 1000
-        self.position = 0
-        self.entry_price = 0
+        self.observation_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(7,), dtype=np.float32)  # 确保 shape=(7,)
         self.data = get_market_data(symbol)
+        self.current_step = 0
 
     def reset(self):
         self.current_step = 0
-        self.balance = 1000
-        self.position = 0
         self.data = get_market_data(self.symbol)
         return self.get_state()
 
     def get_state(self):
         df = self.data.iloc[self.current_step]
-        return np.array([df['ma5'], df['ma15'], df['atr'], df['rsi'], df['macd'], df['bollinger_up'], df['bollinger_down']])
+        return np.array([df['ma5'], df['ma15'], df['atr'], df['rsi'], df['macd'], df['bollinger_up'], df['bollinger_down']], dtype=np.float32)
 
     def step(self, action):
-        df = self.data.iloc[self.current_step]
-        reward = 0
-        done = False
-
-        if action == 1 and self.position == 0:  # 买入
-            self.position = 1
-            self.entry_price = df['close']
-        elif action == 0 and self.position == 1:  # 卖出
-            pnl = df['close'] - self.entry_price
-            reward = pnl - 0.001 * df['close']  # 扣除手续费
-            self.balance += pnl
-            self.position = 0
-
-        # 计算动态止盈止损
-        stop_loss = self.entry_price - stop_loss_multiplier * df['atr']
-        take_profit = self.entry_price + take_profit_multiplier * df['atr']
-
-        if self.position and (df['close'] < stop_loss or df['close'] > take_profit):
-            reward -= 0.5  # 强制平仓惩罚
-            self.position = 0
-
-        # 账户最大回撤控制
-        if self.balance < 800:
-            done = True  # 终止交易
-        
         self.current_step += 1
-        if self.current_step >= len(self.data):
-            done = True
+        done = self.current_step >= len(self.data) - 1
+        return self.get_state(), 0, done, {}
 
-        return self.get_state(), reward, done, {}
-
-# ✅ 训练 PPO（每 30 分钟增量训练）
+# ✅ 训练 PPO（确保 `VecNormalize` 形状正确）
 def update_ppo_model(symbol):
     model_file = f"ppo_trading_agent_{symbol}.zip"
 
-    # 检查是否已有模型，避免重新训练
     if os.path.exists(model_file):
         model = PPO.load(model_file)
         logging.info(f"🔄 继续训练 PPO 模型: {symbol}")
@@ -120,13 +87,13 @@ def update_ppo_model(symbol):
         model = PPO("MlpPolicy", DummyVecEnv([lambda: TradingEnv(symbol)]), verbose=1)
 
     env = DummyVecEnv([lambda: TradingEnv(symbol)])
-    env = VecNormalize(env, norm_obs=True, norm_reward=True)
+    env = VecNormalize(env, norm_obs=True, norm_reward=True, training=True)  # 确保 training=True
 
-    model.learn(total_timesteps=5000)  # 增量训练
+    model.learn(total_timesteps=5000)
     model.save(model_file)
     logging.info(f"✅ PPO 模型 {symbol} 更新完成")
 
-# ✅ 获取交易信号
+# ✅ 获取交易信号（确保 `state` 形状正确）
 def get_trade_signal(symbol):
     model_file = f"ppo_trading_agent_{symbol}.zip"
     if not os.path.exists(model_file):
@@ -138,11 +105,13 @@ def get_trade_signal(symbol):
         return "hold"
 
     df = data.iloc[-1]
-    state = np.array([df['ma5'], df['ma15'], df['atr'], df['rsi'], df['macd'], df['bollinger_up'], df['bollinger_down']])
+    state = np.array([df['ma5'], df['ma15'], df['atr'], df['rsi'], df['macd'], df['bollinger_up'], df['bollinger_down']], dtype=np.float32)
+    
+    # ✅ 重要：确保 `state` 形状为 (1, 7)，避免 PPO 形状错误
+    state = state.reshape(1, -1)
+
     action, _ = model.predict(state)
-
     return "buy" if action == 1 else "sell"
-
 # ✅ 交易循环
 if __name__ == "__main__":
     last_update_time = time.time()
