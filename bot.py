@@ -16,11 +16,14 @@ logging.basicConfig(filename='trading_bot.log', level=logging.INFO, format='%(as
 
 # ✅ OKX API 配置
 exchange = ccxt.okx({
-    'apiKey': "bc6173d6-075f-4234-8fec-4b180d477381",
-    'secret': "73C9792F1CD74CEA67964AE01E8A306A",
-    'password': "Duan0918.",
+    'apiKey': "your_api_key",
+    'secret': "your_secret_key",
+    'password': "your_api_password",
     'options': {'defaultType': 'swap'},
 })
+
+# ✅ 定义交易对
+symbols = ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP"]  # 🔥 添加这行，防止 `NameError`
 
 # ✅ 缓存市场数据（60 秒有效）
 market_cache = {}
