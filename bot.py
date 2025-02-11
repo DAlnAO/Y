@@ -5,50 +5,31 @@ import numpy as np
 import pandas as pd
 import time
 import logging
-import pickle
-from dotenv import load_dotenv
 from stable_baselines3 import PPO
 from datetime import datetime
 import torch
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
-from stable_baselines3.common.callbacks import CheckpointCallback
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import train_test_split
 
-# ✅ 加载环境变量 (存储API Key安全方式)
-load_dotenv()
-
-# ✅ 日志记录
+# ✅ 统一日志文件
 logging.basicConfig(filename='trading_bot.log', level=logging.INFO, format='%(asctime)s - %(message)s')
 
-# ✅ OKX API 配置 (从环境变量获取密钥)
+# ✅ OKX API 配置
 exchange = ccxt.okx({
-    'apiKey': os.getenv("0f046e6a-1627-4db4-b97d-083d7e6cc16b"),
-    'secret': os.getenv("BF7BC880C73AD54D2528FA271A358C2C"),
-    'password': os.getenv("Duan0918."),
+    'apiKey': "0f046e6a-1627-4db4-b97d-083d7e6cc16b",
+    'secret': "BF7BC880C73AD54D2528FA271A358C2C",
+    'password': "Duan0918.",
     'options': {'defaultType': 'swap'},
 })
 
 # ✅ 交易参数
-symbols = ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP", "ADA-USDT-SWAP"]
-update_interval = 1800  # 30分钟更新模型
-risk_percentage = 0.1  # 每笔交易使用余额的10%
+symbols = ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP", "ADA-USDT-SWAP", "BNB-USDT-SWAP", "XRP-USDT-SWAP", "LTC-USDT-SWAP"]
+trading_frequency = 300  
+update_interval = 1800  # 每 30 分钟更新 PPO
+stop_loss_multiplier = 1.5  
+take_profit_multiplier = 2.5  
+max_drawdown_percentage = 20  
 
-# ✅ 获取账户余额 (自动计算交易量)
-def get_trade_amount(symbol):
-    try:
-        balance = exchange.fetch_balance()
-        usdt_balance = balance.get('total', {}).get('USDT', 0)  # 避免KeyError
-        ticker = exchange.fetch_ticker(symbol)
-        price = ticker['last']
-
-        trade_amount = (usdt_balance * risk_percentage) / price
-        return round(trade_amount, 4) if trade_amount > 0 else 0.01
-    except Exception as e:
-        logging.error(f"❌ 获取交易金额失败: {symbol}, 错误: {e}")
-        return 0.01  # 默认交易量
-
-# ✅ 获取市场数据
+# ✅ 获取市场数据（增加 MACD, Bollinger Bands）
 def get_market_data(symbol, timeframes=['5m'], limit=500):
     try:
         ohlcv = exchange.fetch_ohlcv(symbol, timeframes[0], limit=limit)
@@ -63,70 +44,104 @@ def get_market_data(symbol, timeframes=['5m'], limit=500):
         df['macd'] = df['close'].ewm(span=12).mean() - df['close'].ewm(span=26).mean()
         df['bollinger_up'] = df['close'].rolling(20).mean() + 2 * df['close'].rolling(20).std()
         df['bollinger_down'] = df['close'].rolling(20).mean() - 2 * df['close'].rolling(20).std()
-        df = df.dropna()  # 删除NaN值
+        df = df.dropna()
 
         return df
     except Exception as e:
-        logging.error(f"❌ 获取市场数据失败: {symbol}, 错误: {e}")
+        logging.error(f"❌ 获取市场数据失败: {symbol}，错误: {e}")
         return None
 
-# ✅ 强化学习环境
+# ✅ 强化学习环境（改进奖励机制）
 class TradingEnv(gym.Env):
     def __init__(self, symbol):
         super(TradingEnv, self).__init__()
         self.symbol = symbol
         self.action_space = gym.spaces.Discrete(2)
         self.observation_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(7,), dtype=np.float32)
-        self.data = get_market_data(symbol)
         self.current_step = 0
+        self.balance = 1000
+        self.position = 0
+        self.entry_price = 0
+        self.data = get_market_data(symbol)
 
     def reset(self):
         self.current_step = 0
+        self.balance = 1000
+        self.position = 0
         self.data = get_market_data(self.symbol)
         return self.get_state()
 
     def get_state(self):
         df = self.data.iloc[self.current_step]
-        return np.array([
-            df['ma5'], df['ma15'], df['atr'], df['rsi'], df['macd'],
-            df['bollinger_up'], df['bollinger_down']
-        ], dtype=np.float32).reshape(1, -1)  # ✅ 确保shape (1, 7)
+        return np.array([df['ma5'], df['ma15'], df['atr'], df['rsi'], df['macd'], df['bollinger_up'], df['bollinger_down']])
 
     def step(self, action):
+        df = self.data.iloc[self.current_step]
+        reward = 0
+        done = False
+
+        if action == 1 and self.position == 0:  # 买入
+            self.position = 1
+            self.entry_price = df['close']
+        elif action == 0 and self.position == 1:  # 卖出
+            pnl = df['close'] - self.entry_price
+            reward = pnl - 0.001 * df['close']  # 扣除手续费
+            self.balance += pnl
+            self.position = 0
+
+        # 计算动态止盈止损
+        stop_loss = self.entry_price - stop_loss_multiplier * df['atr']
+        take_profit = self.entry_price + take_profit_multiplier * df['atr']
+
+        if self.position and (df['close'] < stop_loss or df['close'] > take_profit):
+            reward -= 0.5  # 强制平仓惩罚
+            self.position = 0
+
+        # 账户最大回撤控制
+        if self.balance < 800:
+            done = True  # 终止交易
+        
         self.current_step += 1
-        done = self.current_step >= len(self.data) - 1
-        return self.get_state(), 0, done, {}
+        if self.current_step >= len(self.data):
+            done = True
 
-# ✅ 获取交易信号 (结合PPO)
+        return self.get_state(), reward, done, {}
+
+# ✅ 训练 PPO（每 30 分钟增量训练）
+def update_ppo_model(symbol):
+    model_file = f"ppo_trading_agent_{symbol}.zip"
+
+    # 检查是否已有模型，避免重新训练
+    if os.path.exists(model_file):
+        model = PPO.load(model_file)
+        logging.info(f"🔄 继续训练 PPO 模型: {symbol}")
+    else:
+        logging.warning(f"⚠️ {symbol} 没有现有 PPO 模型，重新训练")
+        model = PPO("MlpPolicy", DummyVecEnv([lambda: TradingEnv(symbol)]), verbose=1)
+
+    env = DummyVecEnv([lambda: TradingEnv(symbol)])
+    env = VecNormalize(env, norm_obs=True, norm_reward=True)
+
+    model.learn(total_timesteps=5000)  # 增量训练
+    model.save(model_file)
+    logging.info(f"✅ PPO 模型 {symbol} 更新完成")
+
+# ✅ 获取交易信号
 def get_trade_signal(symbol):
-    try:
-        model = PPO.load(f"ppo_trading_agent_{symbol}.zip")
-    except:
-        logging.warning(f"⚠️ 未找到 PPO 模型 {symbol}, 跳过交易")
-        return "hold"
+    model_file = f"ppo_trading_agent_{symbol}.zip"
+    if not os.path.exists(model_file):
+        update_ppo_model(symbol)
 
+    model = PPO.load(model_file)
     data = get_market_data(symbol)
-    if data is None or data.empty:
+    if data is None:
         return "hold"
 
-    state = data.iloc[-1][['ma5', 'ma15', 'atr', 'rsi', 'macd', 'bollinger_up', 'bollinger_down']].values
-    state = np.expand_dims(state, axis=0)  # ✅ 确保 (1, 7)
-
+    df = data.iloc[-1]
+    state = np.array([df['ma5'], df['ma15'], df['atr'], df['rsi'], df['macd'], df['bollinger_up'], df['bollinger_down']])
     action, _ = model.predict(state)
-    execute_trade(symbol, "buy" if action == 1 else "sell")
 
-# ✅ 执行交易
-def execute_trade(symbol, action):
-    trade_amount = get_trade_amount(symbol)
-    if trade_amount <= 0:
-        logging.warning(f"⚠️ {symbol} 交易量过低, 跳过交易")
-        return
-
-    try:
-        order = exchange.create_order(symbol, type="market", side=action, amount=trade_amount)
-        logging.info(f"✅ {action.upper()} {symbol}, 数量: {trade_amount}, 订单ID: {order['id']}")
-    except Exception as e:
-        logging.error(f"❌ 交易失败: {symbol}, 错误: {e}")
+    return "buy" if action == 1 else "sell"
 
 # ✅ 交易循环
 if __name__ == "__main__":
@@ -134,10 +149,16 @@ if __name__ == "__main__":
 
     while True:
         for symbol in symbols:
-            get_trade_signal(symbol)
+            action = get_trade_signal(symbol)
+            if action in ["buy", "sell"]:
+                logging.info(f"{symbol}: {action}")
 
+        # 每 30 分钟更新 PPO 模型
         if time.time() - last_update_time > update_interval:
+            logging.info("🔄 开始增量训练 PPO 模型...")
+            for symbol in symbols:
+                update_ppo_model(symbol)
             last_update_time = time.time()
+            logging.info("✅ PPO 训练更新完成")
 
-        logging.info(f"⏳ 休眠 300 秒后继续交易")
-        time.sleep(300)
+        time.sleep(trading_frequency)
