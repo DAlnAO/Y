@@ -19,8 +19,7 @@ exchange = ccxt.okx({
     'apiKey': "0f046e6a-1627-4db4-b97d-083d7e6cc16b",
     'secret': "BF7BC880C73AD54D2528FA271A358C2C",
     'password': "Duan0918.",
-    'sandboxMode': True  # ✅ 这里必须加逗号
-})
+    'options': {'defaultType': 'swap'}
 
 # ✅ 定义交易对
 symbols = ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP"]  # 🔥 添加这行，防止 `NameError`
