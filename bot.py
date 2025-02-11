@@ -1,3 +1,4 @@
+import os
 import ccxt
 import gym
 import numpy as np
@@ -9,19 +10,17 @@ from stable_baselines3 import PPO
 from collections import deque
 from datetime import datetime
 import torch
-from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
-from stable_baselines3.common.envs import DummyVecEnv
+from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 from stable_baselines3.common.callbacks import CheckpointCallback
-from stable_baselines3.common.vec_env import VecNormalize
 
 # ✅ 统一日志文件
 logging.basicConfig(filename='trading_bot.log', level=logging.INFO, format='%(asctime)s - %(message)s')
 
 # ✅ OKX API 配置
 exchange = ccxt.okx({
-    'apiKey': "0f046e6a-1627-4db4-b97d-083d7e6cc16b",
-    'secret': "BF7BC880C73AD54D2528FA271A358C2C",
-    'password': "Duan0918.",
+    'apiKey': "your_api_key",
+    'secret': "your_secret_key",
+    'password': "your_api_password",
     'options': {'defaultType': 'swap'},
 })
 
@@ -64,7 +63,7 @@ def get_market_data(symbol, timeframes=['5m'], limit=500):
             market_data[tf] = df
 
             # 记录市场数据
-            logging.info(f"市场数据 ({symbol} - {tf}): 最近数据点 - MA5: {df['ma5'].iloc[-1]}, MA15: {df['ma15'].iloc[-1]}, ATR: {df['atr'].iloc[-1]}, RSI: {df['rsi'].iloc[-1]}")
+            logging.info(f"市场数据 ({symbol} - {tf}): MA5: {df['ma5'].iloc[-1]}, MA15: {df['ma15'].iloc[-1]}, ATR: {df['atr'].iloc[-1]}, RSI: {df['rsi'].iloc[-1]}")
         
         return market_data
     except Exception as e:
@@ -80,11 +79,10 @@ def calculate_position_size(usdt_balance, max_position_percentage, symbol):
     current_price = market_data['5m']['close'].iloc[-1]
     atr = market_data['5m']['atr'].iloc[-1]
     
-    # 基于ATR动态调整仓位
-    volatility_factor = max(1, atr / current_price)  # ATR越大，波动性越高，仓位越小
+    volatility_factor = max(1, atr / current_price)  
     available_balance = usdt_balance * (max_position_percentage / 100) * (1 / volatility_factor)
 
-    logging.info(f"计算仓位: {symbol} 基于ATR调整后的仓位为 {available_balance} USDT (当前价格: {current_price}, ATR: {atr})")
+    logging.info(f"计算仓位: {symbol} ATR调整后仓位 = {available_balance} USDT (当前价格: {current_price}, ATR: {atr})")
     
     return available_balance
 
@@ -96,103 +94,16 @@ def check_max_drawdown(current_balance, initial_balance):
         return True
     return False
 
-# ✅ 执行交易
-def execute_trade(symbol, action, usdt_balance):
-    try:
-        # 获取当前账户余额信息
-        available_balance, occupied_balance = get_balance()
-        
-        # 计算仓位
-        position_size = calculate_position_size(available_balance, max_position_percentage, symbol)
-        
-        # 记录交易前的账户信息
-        logging.info(f"交易前账户信息: 当前余额 = {usdt_balance}, 可用余额 = {available_balance}, 占用资金 = {occupied_balance}")
-        
-        # 执行买入/卖出操作
-        if action == "buy" and position_size > 0:
-            ticker = exchange.fetch_ticker(symbol)
-            price = ticker['ask']  # 获取买入价格（买一价）
-            limit_price = price * 1.01  # 限价单稍微高于市场价格，减少滑点
-            exchange.create_limit_buy_order(symbol, position_size, limit_price)
-            logging.info(f"✅ 交易成功: {action.upper()} {position_size} {symbol} 限价单价格: {limit_price}")
-        
-        elif action == "sell" and position_size > 0:
-            ticker = exchange.fetch_ticker(symbol)
-            price = ticker['bid']  # 获取卖出价格（卖一价）
-            limit_price = price * 0.99  # 限价单稍微低于市场价格，减少滑点
-            exchange.create_limit_sell_order(symbol, position_size, limit_price)
-            logging.info(f"✅ 交易成功: {action.upper()} {position_size} {symbol} 限价单价格: {limit_price}")
-        
-        # 记录交易
-        trade_info = {
-            "symbol": symbol,
-            "action": action,
-            "position_size": position_size,
-            "price": exchange.fetch_ticker(symbol)['last'],
-            "timestamp": time.time()
-        }
-        trade_history.append(trade_info)
-        
-        # 记录交易后的账户信息
-        available_balance, occupied_balance = get_balance()
-        logging.info(f"交易后账户信息: 当前余额 = {usdt_balance}, 可用余额 = {available_balance}, 占用资金 = {occupied_balance}")
-    
-    except Exception as e:
-        logging.error(f"⚠️ 交易失败: {e}")
-
-# ✅ 执行交易策略
-def trade():
-    for symbol in symbols:
-        action = get_trade_signal(symbol)
-        execute_trade(symbol, action, current_balance)
-
-# ✅ 获取交易信号（PPO）
-def get_trade_signal(symbol):
-    try:
-        model_file = f"ppo_trading_agent_{symbol}.zip"
-        
-        # 如果模型文件不存在，则训练一个新的模型
-        if not os.path.exists(model_file):
-            logging.info(f"⚠️ 模型文件 {model_file} 不存在，正在训练新的模型...")
-            train_model(symbol)
-        
-        ppo_model = PPO.load(model_file)
-        data = get_market_data(symbol, timeframes=['5m'])
-        if not data:
-            logging.info(f"⚠️ 无法获取市场数据，无法生成交易信号")
-            return "hold"
-
-        df = data['5m']
-        state = np.array([
-            df['ma5'].iloc[-1],
-            df['ma15'].iloc[-1],
-            df['atr'].iloc[-1],
-            df['rsi'].iloc[-1]
-        ])
-
-        # 记录状态输入
-        logging.info(f"交易信号生成: {symbol} 当前状态 - MA5: {df['ma5'].iloc[-1]}, MA15: {df['ma15'].iloc[-1]}, ATR: {df['atr'].iloc[-1]}, RSI: {df['rsi'].iloc[-1]}")
-        
-        ppo_action, _ = ppo_model.predict(state)
-        action = "buy" if ppo_action == 1 else "sell"
-        logging.info(f"交易信号: {symbol} 推荐操作: {action.upper()}")
-        return action
-    except Exception as e:
-        logging.error(f"⚠️ 获取交易信号失败: {e}")
-        return "hold"
-
 # ✅ 训练模型
 def train_model(symbol):
-    # 定义自定义环境
     class TradingEnv(gym.Env):
         def __init__(self):
             super(TradingEnv, self).__init__()
-            self.action_space = gym.spaces.Discrete(2)  # 只有两个动作: 买 (1) 或 卖 (0)
+            self.action_space = gym.spaces.Discrete(2)
             self.observation_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(4,), dtype=np.float32)
 
         def reset(self):
             self.current_step = 0
-            self.done = False
             self.data = get_market_data(symbol)
             self.state = np.array([
                 self.data['5m']['ma5'].iloc[0],
@@ -204,32 +115,67 @@ def train_model(symbol):
 
         def step(self, action):
             self.current_step += 1
-            reward = 0  # 这里可以根据实际逻辑计算奖励
-            if self.current_step > len(self.data['5m']):
-                self.done = True
-            return self.state, reward, self.done, {}
+            reward = 0  
+            if self.current_step >= len(self.data['5m']):
+                done = True
+            else:
+                done = False
+            return self.state, reward, done, {}
 
-    # 环境设置
     env = DummyVecEnv([lambda: TradingEnv()])
     env = VecNormalize(env, norm_obs=True, norm_reward=True)
     
-    # 训练 PPO 模型
     model = PPO("MlpPolicy", env, verbose=1)
     model.learn(total_timesteps=10000)
-    
-    # 保存模型
     model.save(f"ppo_trading_agent_{symbol}")
-    logging.info(f"✅ 模型 {symbol} 训练完成并保存")
+    logging.info(f"✅ 训练完成: {symbol}")
+
+# ✅ 获取交易信号（PPO）
+def get_trade_signal(symbol):
+    model_file = f"ppo_trading_agent_{symbol}.zip"
     
-# ✅ 启动交易与训练
+    if not os.path.exists(model_file):
+        logging.info(f"⚠️ 未找到模型 {model_file}，正在训练...")
+        train_model(symbol)
+    
+    ppo_model = PPO.load(model_file)
+    data = get_market_data(symbol, timeframes=['5m'])
+    if not data:
+        return "hold"
+
+    df = data['5m']
+    state = np.array([
+        df['ma5'].iloc[-1],
+        df['ma15'].iloc[-1],
+        df['atr'].iloc[-1],
+        df['rsi'].iloc[-1]
+    ])
+
+    ppo_action, _ = ppo_model.predict(state)
+    return "buy" if ppo_action == 1 else "sell"
+
+# ✅ 执行交易
+def execute_trade(symbol, action, usdt_balance):
+    try:
+        available_balance, occupied_balance = get_balance()
+        position_size = calculate_position_size(available_balance, max_position_percentage, symbol)
+
+        if action == "buy" and position_size > 0:
+            exchange.create_market_buy_order(symbol, position_size)
+            logging.info(f"✅ 交易成功: {action.upper()} {position_size} {symbol}")
+        
+        elif action == "sell" and position_size > 0:
+            exchange.create_market_sell_order(symbol, position_size)
+            logging.info(f"✅ 交易成功: {action.upper()} {position_size} {symbol}")
+    except Exception as e:
+        logging.error(f"⚠️ 交易失败: {e}")
+
+# ✅ 启动交易
 if __name__ == "__main__":
     while True:
-        # 每5分钟反馈一次市场数据、信号及仓位等
-        start_time = time.time()
-
         if check_max_drawdown(current_balance, initial_balance):
             break
-        trade()
-        
-        # 每5分钟执行一次
-        time.sleep(trading_frequency - (time.time() - start_time))
+        for symbol in symbols:
+            action = get_trade_signal(symbol)
+            execute_trade(symbol, action, current_balance)
+        time.sleep(trading_frequency)
