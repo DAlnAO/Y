@@ -123,8 +123,8 @@ def run_strategy():
     else:
         logger.info("当前市场无符合策略的合约交易机会")
 
-# 每 30 分钟运行一次
-schedule.every(30).minutes.do(run_strategy)
+# 每 1 分钟运行一次
+schedule.every(1).minutes.do(run_strategy)
 
 if __name__ == "__main__":
     logger.info("OKX 合约交易策略机器人启动...")
