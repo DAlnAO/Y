@@ -194,15 +194,15 @@ def run_strategy():
 
 # 总结策略结果
 def summarize_results():
-    logger.info("【策略总结】每 30 分钟总结一次策略结果")
+    logger.info("【策略总结】每 2 分钟总结一次策略结果")
     # 这里可以根据你的需求总结交易策略的执行情况，例如，执行次数、胜率等
-    logger.info("【策略总结】策略结果总结: 在过去的 30 分钟内运行了 6 次策略")
+    logger.info("【策略总结】策略结果总结: 在过去的 2 分钟内运行了 6 次策略")
 
-# 每 5 分钟运行一次策略
+# 每 1 分钟运行一次策略
 def job_run_strategy():
     run_strategy()
 
-# 每 30 分钟总结策略结果
+# 每 2 分钟总结策略结果
 def job_summarize_results():
     summarize_results()
 
@@ -216,8 +216,8 @@ if __name__ == "__main__":
             time.sleep(1)
     
     # 设置任务计划
-    schedule.every(5).minutes.do(job_run_strategy)  # 每 5 分钟运行一次策略
-    schedule.every(30).minutes.do(job_summarize_results)  # 每 30 分钟总结一次策略结果
+    schedule.every(1).minute.do(job_run_strategy)  # 每 1 分钟运行一次策略
+    schedule.every(2).minutes.do(job_summarize_results)  # 每 2 分钟总结一次策略结果
     
     # 启动调度线程
     scheduler_thread = threading.Thread(target=scheduler_thread)
