@@ -20,8 +20,9 @@ def get_okx_data(symbol, timeframe="15m", limit=200):
         data = response.json()
         
         if "data" in data:
-            df = pd.DataFrame(data["data"], columns=["timestamp", "open", "high", "low", "close", "volume", "_"])
-            df = df.drop(columns=["_"])
+            # 假设返回的数据包含 9 列，修改列名并去除不必要的列
+            df = pd.DataFrame(data["data"], columns=["timestamp", "open", "high", "low", "close", "volume", "close_ask", "close_bid", "instrument_id"])
+            df = df.drop(columns=["instrument_id", "close_ask", "close_bid"])  # 移除不必要的列
             df["timestamp"] = pd.to_datetime(df["timestamp"], unit='ms')
             df[["open", "high", "low", "close", "volume"]] = df[["open", "high", "low", "close", "volume"]].astype(float)
             return df[::-1].reset_index(drop=True)
