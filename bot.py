@@ -1,54 +1,36 @@
+import logging
 import requests
 import pandas as pd
-import numpy as np
-import time
-import schedule
-import telebot
 import ta
 from datetime import datetime
+import time
+import schedule
 
-# Telegram 机器人 Token 和 Chat ID（请替换为你的）
-TELEGRAM_BOT_TOKEN = "your_telegram_bot_token"
-TELEGRAM_CHAT_ID = "your_chat_id"
-bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
+# 设置日志记录到文件
+logging.basicConfig(level=logging.INFO, 
+                    format='%(asctime)s - %(message)s', 
+                    handlers=[logging.FileHandler('trading_bot.log', 'a', 'utf-8')])
+logger = logging.getLogger()
 
 # OKX API 获取 K 线数据
 def get_okx_data(symbol, timeframe="15m", limit=200):
-    url = f"https://www.okx.com/api/v5/market/candles?instId={symbol}&bar={timeframe}&limit={limit}"
-    response = requests.get(url)
-    data = response.json()
-    
-    if "data" in data:
-        df = pd.DataFrame(data["data"], columns=["timestamp", "open", "high", "low", "close", "volume", "_"])
-        df = df.drop(columns=["_"])
-        df["timestamp"] = pd.to_datetime(df["timestamp"], unit='ms')
-        df[["open", "high", "low", "close", "volume"]] = df[["open", "high", "low", "close", "volume"]].astype(float)
-        return df[::-1].reset_index(drop=True)
-    return None
-
-# 计算技术指标
-def calculate_indicators(df):
-    df["SMA_50"] = ta.trend.sma_indicator(df["close"], window=50)
-    df["SMA_200"] = ta.trend.sma_indicator(df["close"], window=200)
-    
-    macd = ta.trend.MACD(df["close"])
-    df["MACD"] = macd.macd()
-    df["MACD_signal"] = macd.macd_signal()
-    
-    df["RSI"] = ta.momentum.RSIIndicator(df["close"]).rsi()
-    
-    adx = ta.trend.ADXIndicator(df["high"], df["low"], df["close"])
-    df["ADX"] = adx.adx()
-    
-    df["ATR"] = ta.volatility.AverageTrueRange(df["high"], df["low"], df["close"]).average_true_range()
-    
-    bollinger = ta.volatility.BollingerBands(df["close"])
-    df["BB_upper"] = bollinger.bollinger_hband()
-    df["BB_lower"] = bollinger.bollinger_lband()
-    
-    df["VWAP"] = ta.volume.VolumeWeightedAveragePrice(df["high"], df["low"], df["close"], df["volume"]).volume_weighted_average_price()
-    
-    return df
+    try:
+        url = f"https://www.okx.com/api/v5/market/candles?instId={symbol}&bar={timeframe}&limit={limit}"
+        response = requests.get(url)
+        data = response.json()
+        
+        if "data" in data:
+            df = pd.DataFrame(data["data"], columns=["timestamp", "open", "high", "low", "close", "volume", "_"])
+            df = df.drop(columns=["_"])
+            df["timestamp"] = pd.to_datetime(df["timestamp"], unit='ms')
+            df[["open", "high", "low", "close", "volume"]] = df[["open", "high", "low", "close", "volume"]].astype(float)
+            return df[::-1].reset_index(drop=True)
+        else:
+            logger.warning(f"获取数据失败: {symbol} 没有返回数据")
+            return None
+    except Exception as e:
+        logger.error(f"获取 OKX 数据时发生错误: {e}")
+        return None
 
 # 筛选符合交易策略的币种
 def filter_trading_opportunities(symbol):
@@ -103,13 +85,19 @@ def filter_trading_opportunities(symbol):
 
 # 获取 OKX 可交易合约列表
 def get_okx_contracts():
-    url = "https://www.okx.com/api/v5/public/instruments?instType=SWAP"
-    response = requests.get(url)
-    data = response.json()
-    
-    if "data" in data:
-        return [item["instId"] for item in data["data"]]
-    return []
+    try:
+        url = "https://www.okx.com/api/v5/public/instruments?instType=SWAP"
+        response = requests.get(url)
+        data = response.json()
+        
+        if "data" in data:
+            return [item["instId"] for item in data["data"]]
+        else:
+            logger.warning("获取 OKX 合约列表失败")
+            return []
+    except Exception as e:
+        logger.error(f"获取 OKX 合约列表时发生错误: {e}")
+        return []
 
 # 运行策略，选择最佳 3 个交易标的
 def run_strategy():
@@ -130,15 +118,16 @@ def run_strategy():
             message += f"⛔ 止损: {trade['stop_loss']:.2f}\n"
             message += f"🎯 止盈: {trade['take_profit']:.2f}\n\n"
 
-        bot.send_message(TELEGRAM_CHAT_ID, message)
+        # 将策略输出记录到日志文件
+        logger.info(message)
     else:
-        bot.send_message(TELEGRAM_CHAT_ID, "当前市场无符合策略的合约交易机会")
+        logger.info("当前市场无符合策略的合约交易机会")
 
 # 每 30 分钟运行一次
 schedule.every(30).minutes.do(run_strategy)
 
 if __name__ == "__main__":
-    print("OKX 合约交易策略机器人启动...")
+    logger.info("OKX 合约交易策略机器人启动...")
     while True:
         schedule.run_pending()
         time.sleep(1)
