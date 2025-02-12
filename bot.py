@@ -1,162 +1,144 @@
-import os
-import ccxt
-import gym
-import numpy as np
+import requests
 import pandas as pd
+import numpy as np
 import time
-import logging
-from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
-from stable_baselines3.common.callbacks import CheckpointCallback
+import schedule
+import telebot
+import ta
+from datetime import datetime
 
-# ✅ 统一日志文件
-logging.basicConfig(filename='trading_bot.log', level=logging.INFO, format='%(asctime)s - %(message)s')
+# Telegram 机器人 Token 和 Chat ID（请替换为你的）
+TELEGRAM_BOT_TOKEN = "your_telegram_bot_token"
+TELEGRAM_CHAT_ID = "your_chat_id"
+bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
 
-# ✅ OKX API 配置
-exchange = ccxt.okx({
-    'apiKey': "0f046e6a-1627-4db4-b97d-083d7e6cc16b",
-    'secret': "BF7BC880C73AD54D2528FA271A358C2C",
-    'password': "Duan0918.",
-    'options': {'defaultType': 'swap'},
-})
+# OKX API 获取 K 线数据
+def get_okx_data(symbol, timeframe="15m", limit=200):
+    url = f"https://www.okx.com/api/v5/market/candles?instId={symbol}&bar={timeframe}&limit={limit}"
+    response = requests.get(url)
+    data = response.json()
+    
+    if "data" in data:
+        df = pd.DataFrame(data["data"], columns=["timestamp", "open", "high", "low", "close", "volume", "_"])
+        df = df.drop(columns=["_"])
+        df["timestamp"] = pd.to_datetime(df["timestamp"], unit='ms')
+        df[["open", "high", "low", "close", "volume"]] = df[["open", "high", "low", "close", "volume"]].astype(float)
+        return df[::-1].reset_index(drop=True)
+    return None
 
-# ✅ 交易参数
-symbols = ["BTC-USDT-SWAP", "ETH-USDT-SWAP"]
-risk_percentage = 10  
-max_position_percentage = 50  
-trading_frequency = 300  
-stop_loss_percentage = 5  
-take_profit_percentage = 10  
+# 计算技术指标
+def calculate_indicators(df):
+    df["SMA_50"] = ta.trend.sma_indicator(df["close"], window=50)
+    df["SMA_200"] = ta.trend.sma_indicator(df["close"], window=200)
+    
+    macd = ta.trend.MACD(df["close"])
+    df["MACD"] = macd.macd()
+    df["MACD_signal"] = macd.macd_signal()
+    
+    df["RSI"] = ta.momentum.RSIIndicator(df["close"]).rsi()
+    
+    adx = ta.trend.ADXIndicator(df["high"], df["low"], df["close"])
+    df["ADX"] = adx.adx()
+    
+    df["ATR"] = ta.volatility.AverageTrueRange(df["high"], df["low"], df["close"]).average_true_range()
+    
+    bollinger = ta.volatility.BollingerBands(df["close"])
+    df["BB_upper"] = bollinger.bollinger_hband()
+    df["BB_lower"] = bollinger.bollinger_lband()
+    
+    df["VWAP"] = ta.volume.VolumeWeightedAveragePrice(df["high"], df["low"], df["close"], df["volume"]).volume_weighted_average_price()
+    
+    return df
 
-# ✅ **获取市场数据（多时间框架 + 更多特征）**
-def get_market_data(symbol, timeframes=['5m', '15m', '1h'], limit=500):
-    try:
-        market_data = {}
-        for tf in timeframes:
-            ohlcv = exchange.fetch_ohlcv(symbol, tf, limit=limit)
-            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-
-            # 技术指标计算
-            df['ma5'] = df['close'].rolling(5).mean()
-            df['ma15'] = df['close'].rolling(15).mean()
-            df['atr'] = df['high'].rolling(14).max() - df['low'].rolling(14).min()
-            df['rsi'] = 100 - (100 / (1 + df['close'].pct_change().rolling(14).mean()))
-            df['vol_ma'] = df['volume'].rolling(10).mean()  # 成交量均线
-            df['bollinger_up'] = df['close'].rolling(20).mean() + (df['close'].rolling(20).std() * 2)
-            df['bollinger_down'] = df['close'].rolling(20).mean() - (df['close'].rolling(20).std() * 2)
-
-            df = df.dropna()
-            if not df.empty:
-                market_data[tf] = df
-        
-        return market_data if market_data else None
-    except Exception as e:
-        logging.warning(f"⚠️ 获取市场数据失败: {symbol} | {e}")
+# 筛选符合交易策略的币种
+def filter_trading_opportunities(symbol):
+    df = get_okx_data(symbol)
+    if df is None:
         return None
-
-# ✅ **强化学习环境（增加更多特征 + 多时间框架）**
-class TradingEnv(gym.Env):
-    def __init__(self, symbol):
-        super(TradingEnv, self).__init__()
-        self.symbol = symbol
-        self.action_space = gym.spaces.Discrete(3)  # 0: 持有, 1: 买入, 2: 卖出
-        self.observation_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(8,), dtype=np.float32)
-        self.current_step = 0
-        self.data = None
-
-    def reset(self):
-        self.current_step = 0
-        self.data = get_market_data(self.symbol)
-        if self.data is None or '5m' not in self.data or self.data['5m'].empty:
-            return np.zeros(8) 
-
-        self.state = np.array([
-            self.data['5m']['ma5'].iloc[0],
-            self.data['5m']['ma15'].iloc[0],
-            self.data['15m']['ma5'].iloc[0],
-            self.data['15m']['ma15'].iloc[0],
-            self.data['5m']['atr'].iloc[0],
-            self.data['5m']['rsi'].iloc[0],
-            self.data['5m']['bollinger_up'].iloc[0],
-            self.data['5m']['bollinger_down'].iloc[0]
-        ])
-        return self.state
-
-    def step(self, action):
-        self.current_step += 1
-        if self.current_step >= len(self.data['5m']):
-            return self.state, 0, True, {}
-
-        return self.state, 0, False, {}
-
-# ✅ **训练模型**
-def train_model(symbol):
-    logging.info(f"开始训练模型: {symbol}")
-
-    env = DummyVecEnv([lambda: TradingEnv(symbol)])
-    env = VecNormalize(env, norm_obs=True, norm_reward=True)
-
-    model = PPO("MlpPolicy", env, verbose=1)
-    model.learn(total_timesteps=100000)
-    model.save(f"ppo_trading_agent_{symbol}")
-
-    logging.info(f"✅ 训练完成: {symbol}")
-
-# ✅ **获取交易信号**
-def get_trade_signal(symbol):
-    model_file = f"ppo_trading_agent_{symbol}.zip"
     
-    if not os.path.exists(model_file):
-        logging.info(f"⚠️ 模型 {model_file} 不存在，正在训练...")
-        train_model(symbol)
+    df = calculate_indicators(df)
     
-    ppo_model = PPO.load(model_file)
-    data = get_market_data(symbol, timeframes=['5m'])
+    latest = df.iloc[-1]
+    close_price = latest["close"]
+    atr = latest["ATR"]
+    
+    # 做多信号
+    long_conditions = [
+        latest["SMA_50"] > latest["SMA_200"],
+        latest["MACD"] > latest["MACD_signal"],
+        latest["RSI"] > 50,
+        latest["ADX"] > 25,
+        latest["close"] > latest["BB_lower"],
+        latest["close"] > latest["VWAP"]
+    ]
+    
+    # 做空信号
+    short_conditions = [
+        latest["SMA_50"] < latest["SMA_200"],
+        latest["MACD"] < latest["MACD_signal"],
+        latest["RSI"] < 50,
+        latest["ADX"] > 25,
+        latest["close"] < latest["BB_upper"],
+        latest["close"] < latest["VWAP"]
+    ]
 
-    if not data or '5m' not in data or data['5m'].empty:
-        return "hold"
+    if all(long_conditions):
+        return {
+            "symbol": symbol,
+            "side": "做多",
+            "entry": close_price,
+            "stop_loss": close_price - 2 * atr,
+            "take_profit": close_price + 4 * atr
+        }
+    elif all(short_conditions):
+        return {
+            "symbol": symbol,
+            "side": "做空",
+            "entry": close_price,
+            "stop_loss": close_price + 2 * atr,
+            "take_profit": close_price - 4 * atr
+        }
+    
+    return None
 
-    df = data['5m']
-    state = np.array([
-        df['ma5'].iloc[-1],
-        df['ma15'].iloc[-1],
-        df['atr'].iloc[-1],
-        df['rsi'].iloc[-1],
-        df['bollinger_up'].iloc[-1],
-        df['bollinger_down'].iloc[-1]
-    ])
+# 获取 OKX 可交易合约列表
+def get_okx_contracts():
+    url = "https://www.okx.com/api/v5/public/instruments?instType=SWAP"
+    response = requests.get(url)
+    data = response.json()
+    
+    if "data" in data:
+        return [item["instId"] for item in data["data"]]
+    return []
 
-    ppo_action, _ = ppo_model.predict(state)
+# 运行策略，选择最佳 3 个交易标的
+def run_strategy():
+    contracts = get_okx_contracts()
+    potential_trades = []
 
-    if ppo_action == 1:
-        return "buy"
-    elif ppo_action == 2:
-        return "sell"
+    for symbol in contracts[:20]:  
+        trade_info = filter_trading_opportunities(symbol)
+        if trade_info:
+            potential_trades.append(trade_info)
+
+    if potential_trades:
+        message = "📊 **OKX 合约交易策略** 📊\n"
+        for trade in potential_trades[:3]:
+            message += f"🔹 交易对: {trade['symbol']}\n"
+            message += f"📈 方向: {trade['side']}\n"
+            message += f"🎯 进场价格: {trade['entry']:.2f}\n"
+            message += f"⛔ 止损: {trade['stop_loss']:.2f}\n"
+            message += f"🎯 止盈: {trade['take_profit']:.2f}\n\n"
+
+        bot.send_message(TELEGRAM_CHAT_ID, message)
     else:
-        return "hold"
+        bot.send_message(TELEGRAM_CHAT_ID, "当前市场无符合策略的合约交易机会")
 
-# ✅ **执行交易**
-def execute_trade(symbol, action):
-    try:
-        balance = exchange.fetch_balance()
-        usdt_balance = balance['total']['USDT']
-        last_price = exchange.fetch_ticker(symbol)['last']
+# 每 30 分钟运行一次
+schedule.every(30).minutes.do(run_strategy)
 
-        if action == "buy":
-            exchange.create_market_buy_order(symbol, 1)
-            logging.info(f"✅ {symbol} 买入成功")
-        elif action == "sell":
-            exchange.create_market_sell_order(symbol, 1)
-            logging.info(f"✅ {symbol} 卖出成功")
-    except Exception as e:
-        logging.error(f"⚠️ 交易失败: {e}")
-
-# ✅ **交易循环**
 if __name__ == "__main__":
+    print("OKX 合约交易策略机器人启动...")
     while True:
-        for symbol in symbols:
-            action = get_trade_signal(symbol)
-            if action in ["buy", "sell"]:
-                execute_trade(symbol, action)
-        time.sleep(trading_frequency)
+        schedule.run_pending()
+        time.sleep(1)
