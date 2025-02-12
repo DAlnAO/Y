@@ -13,8 +13,8 @@ logging.basicConfig(level=logging.INFO,
                     handlers=[logging.FileHandler('trading_bot.log', 'a', 'utf-8')])
 logger = logging.getLogger()
 
-# OKX API 获取 K 线数据
-def get_okx_data(symbol, timeframe="15m", limit=200):
+# OKX API 获取 K 线数据（可调节频率）
+def get_okx_data(symbol, timeframe="1m", limit=200):
     try:
         url = f"https://www.okx.com/api/v5/market/candles?instId={symbol}&bar={timeframe}&limit={limit}"
         logger.info(f"【获取数据】 请求 URL: {url}")
@@ -35,6 +35,26 @@ def get_okx_data(symbol, timeframe="15m", limit=200):
         logger.error(f"【获取数据失败】 获取 OKX 数据时发生错误: {e}")
         return None
 
+# 获取市场深度（Order Book）数据
+def get_order_book(symbol):
+    try:
+        url = f"https://www.okx.com/api/v5/market/depth?instId={symbol}&size=5"
+        logger.info(f"【获取深度数据】 请求 URL: {url}")
+        response = requests.get(url)
+        data = response.json()
+        
+        if "data" in data:
+            order_book = data["data"][0]
+            bid_depth = order_book['bids']
+            ask_depth = order_book['asks']
+            return bid_depth, ask_depth
+        else:
+            logger.warning(f"【获取深度数据失败】 {symbol} 没有返回深度数据")
+            return None, None
+    except Exception as e:
+        logger.error(f"【获取深度数据失败】 获取市场深度时发生错误: {e}")
+        return None, None
+
 # 计算指标
 def calculate_indicators(df):
     logger.info("【计算指标】开始计算技术指标")
@@ -47,6 +67,9 @@ def calculate_indicators(df):
     df["ATR"] = ta.volatility.average_true_range(df["high"], df["low"], df["close"])
     df["BB_upper"], df["BB_middle"], df["BB_lower"] = ta.volatility.bollinger_hband(df["close"]), ta.volatility.bollinger_mavg(df["close"]), ta.volatility.bollinger_lband(df["close"])
     df["VWAP"] = ta.volume.volume_weighted_average_price(df["high"], df["low"], df["close"], df["volume"], window=14)
+
+    # 添加量价关系指标：成交量与价格的结合
+    df["Price_Volume_Trend"] = ta.trend.price_volume_trend(df["close"], df["volume"])
 
     logger.info(f"【计算指标】完成技术指标计算")
     return df
@@ -65,6 +88,18 @@ def filter_trading_opportunities(symbol):
     close_price = latest["close"]
     atr = latest["ATR"]
     
+    # 获取市场深度数据
+    bid_depth, ask_depth = get_order_book(symbol)
+    
+    if bid_depth is None or ask_depth is None:
+        logger.info(f"【筛选交易机会】{symbol} 无法获取市场深度数据，跳过")
+        return None
+    
+    # 深度数据处理（买方和卖方的力量对比）
+    highest_bid = float(bid_depth[0][0]) if bid_depth else 0
+    lowest_ask = float(ask_depth[0][0]) if ask_depth else 0
+    spread = lowest_ask - highest_bid
+    
     # 做多信号
     long_conditions = [
         latest["SMA_50"] > latest["SMA_200"],
@@ -72,7 +107,9 @@ def filter_trading_opportunities(symbol):
         latest["RSI"] > 50,
         latest["ADX"] > 25,
         latest["close"] > latest["BB_lower"],
-        latest["close"] > latest["VWAP"]
+        latest["close"] > latest["VWAP"],
+        latest["Price_Volume_Trend"] > 0,  # 量价趋势为正
+        spread < 0.005  # 市场流动性，价差过大可能意味着市场不活跃
     ]
     
     # 做空信号
@@ -82,10 +119,11 @@ def filter_trading_opportunities(symbol):
         latest["RSI"] < 50,
         latest["ADX"] > 25,
         latest["close"] < latest["BB_upper"],
-        latest["close"] < latest["VWAP"]
+        latest["close"] < latest["VWAP"],
+        latest["Price_Volume_Trend"] < 0,  # 量价趋势为负
+        spread < 0.005  # 市场流动性，价差过大可能意味着市场不活跃
     ]
     
-    # 记录每个条件的计算结果
     logger.info(f"【筛选交易机会】{symbol} 做多条件: {long_conditions}")
     logger.info(f"【筛选交易机会】{symbol} 做空条件: {short_conditions}")
 
