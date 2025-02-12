@@ -51,40 +51,47 @@ def calculate_indicators(df):
     logger.info(f"【计算指标】完成技术指标计算")
     return df
 
-# 筛选符合交易策略的币种
+# 筛选符合交易策略的币种（结合 5 分钟和 15 分钟 K 线）
 def filter_trading_opportunities(symbol):
     logger.info(f"【筛选交易机会】开始分析币种: {symbol}")
-    df = get_okx_data(symbol)
-    if df is None:
+    
+    # 获取 5m 和 15m K 线数据
+    df_5m = get_okx_data(symbol, timeframe="5m")
+    df_15m = get_okx_data(symbol, timeframe="15m")
+    
+    if df_5m is None or df_15m is None:
         logger.info(f"【筛选交易机会】{symbol} 数据为空，跳过")
         return None
     
-    df = calculate_indicators(df)
+    # 计算指标
+    df_5m = calculate_indicators(df_5m)
+    df_15m = calculate_indicators(df_15m)
     
-    latest = df.iloc[-1]
-    close_price = latest["close"]
-    atr = latest["ATR"]
+    latest_5m = df_5m.iloc[-1]
+    latest_15m = df_15m.iloc[-1]
     
-    # 做多信号
+    close_price = latest_15m["close"]
+    atr = latest_15m["ATR"]
+
+    # 组合 5m 和 15m 信号
     long_conditions = [
-        latest["SMA_50"] > latest["SMA_200"],
-        latest["MACD"] > latest["MACD_signal"],
-        latest["RSI"] > 50,
-        latest["ADX"] > 25,
-        latest["close"] > latest["BB_lower"],
-        latest["close"] > latest["VWAP"]
+        latest_5m["SMA_50"] > latest_5m["SMA_200"] and latest_15m["SMA_50"] > latest_15m["SMA_200"],
+        latest_5m["MACD"] > latest_5m["MACD_signal"] and latest_15m["MACD"] > latest_15m["MACD_signal"],
+        latest_5m["RSI"] > 50 and latest_15m["RSI"] > 50,
+        latest_5m["ADX"] > 25 and latest_15m["ADX"] > 25,
+        latest_5m["close"] > latest_5m["BB_lower"] and latest_15m["close"] > latest_15m["BB_lower"],
+        latest_5m["close"] > latest_5m["VWAP"] and latest_15m["close"] > latest_15m["VWAP"]
     ]
     
-    # 做空信号
     short_conditions = [
-        latest["SMA_50"] < latest["SMA_200"],
-        latest["MACD"] < latest["MACD_signal"],
-        latest["RSI"] < 50,
-        latest["ADX"] > 25,
-        latest["close"] < latest["BB_upper"],
-        latest["close"] < latest["VWAP"]
+        latest_5m["SMA_50"] < latest_5m["SMA_200"] and latest_15m["SMA_50"] < latest_15m["SMA_200"],
+        latest_5m["MACD"] < latest_5m["MACD_signal"] and latest_15m["MACD"] < latest_15m["MACD_signal"],
+        latest_5m["RSI"] < 50 and latest_15m["RSI"] < 50,
+        latest_5m["ADX"] > 25 and latest_15m["ADX"] > 25,
+        latest_5m["close"] < latest_5m["BB_upper"] and latest_15m["close"] < latest_15m["BB_upper"],
+        latest_5m["close"] < latest_5m["VWAP"] and latest_15m["close"] < latest_15m["VWAP"]
     ]
-    
+
     # 记录每个条件的计算结果
     logger.info(f"【筛选交易机会】{symbol} 做多条件: {long_conditions}")
     logger.info(f"【筛选交易机会】{symbol} 做空条件: {short_conditions}")
@@ -107,7 +114,7 @@ def filter_trading_opportunities(symbol):
             "stop_loss": close_price + 2 * atr,
             "take_profit": close_price - 4 * atr
         }
-    
+
     logger.info(f"【筛选交易机会】{symbol} 不符合交易条件")
     return None
 
