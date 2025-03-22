@@ -1,134 +1,127 @@
-import logging
-import requests
+import ccxt
 import pandas as pd
-import ta
+import numpy as np
 from datetime import datetime
-import time
-import schedule
 
-# 设置日志记录到文件
-logging.basicConfig(level=logging.INFO, 
-                    format='%(asctime)s - %(message)s', 
-                    handlers=[logging.FileHandler('trading_bot.log', 'a', 'utf-8')])
-logger = logging.getLogger()
+# 配置信息（需替换为你的API信息）
+config = {
+    'apiKey': 'YOUR_API_KEY',
+    'secret': 'YOUR_SECRET',
+    'password': 'YOUR_PASSPHRASE',
+    'options': {'defaultType': 'swap'}
+}
 
-# OKX API 获取 K 线数据
-def get_okx_data(symbol, timeframe="15m", limit=200):
+# 初始化OKX连接
+exchange = ccxt.okx(config)
+
+def get_all_contracts():
+    """获取所有USDT合约交易对"""
+    markets = exchange.fetch_markets()
+    return [m['symbol'] for m in markets if 'USDT' in m['symbol'] and 'SWAP' in m['id']]
+
+def fetch_ohlcv_data(symbol):
+    """获取多维历史数据"""
     try:
-        url = f"https://www.okx.com/api/v5/market/candles?instId={symbol}&bar={timeframe}&limit={limit}"
-        response = requests.get(url)
-        data = response.json()
-        
-        if "data" in data:
-            # 假设返回的数据包含 9 列，修改列名并去除不必要的列
-            df = pd.DataFrame(data["data"], columns=["timestamp", "open", "high", "low", "close", "volume", "close_ask", "close_bid", "instrument_id"])
-            df = df.drop(columns=["instrument_id", "close_ask", "close_bid"])  # 移除不必要的列
-            df["timestamp"] = pd.to_datetime(df["timestamp"], unit='ms')
-            df[["open", "high", "low", "close", "volume"]] = df[["open", "high", "low", "close", "volume"]].astype(float)
-            return df[::-1].reset_index(drop=True)
-        else:
-            logger.warning(f"获取数据失败: {symbol} 没有返回数据")
-            return None
+        # 获取1小时K线（最近24小时）
+        ohlcv = exchange.fetch_ohlcv(symbol, '1h', limit=24)
+        df = pd.DataFrame(ohlcv, columns=['timestamp','open','high','low','close','volume'])
+        return df
     except Exception as e:
-        logger.error(f"获取 OKX 数据时发生错误: {e}")
+        print(f"获取{symbol}数据失败: {str(e)}")
         return None
 
-# 筛选符合交易策略的币种
-def filter_trading_opportunities(symbol):
-    df = get_okx_data(symbol)
-    if df is None:
+def calculate_technical_factors(df):
+    """技术指标计算"""
+    # 动量因子
+    df['momentum'] = df['close'].pct_change(periods=6) * 100  # 6小时动量
+    
+    # 波动率因子
+    df['atr'] = df['high'] - df['low']
+    volatility = df['atr'].mean() / df['close'].mean() * 100
+    
+    # 成交量因子
+    volume_score = np.log1p(df['volume'].mean()) * 10  # 对数标准化
+    
+    return {
+        'momentum': df['momentum'].iloc[-1],
+        'volatility': volatility,
+        'volume_score': volume_score
+    }
+
+def get_fundamental_factors(symbol):
+    """基本面因子"""
+    try:
+        ticker = exchange.fetch_ticker(symbol)
+        funding_rate = exchange.fetch_funding_rate(symbol)['fundingRate']
+        
+        return {
+            'price_change': ticker['percentage'] * 100,  # 24小时涨跌幅
+            'funding_rate': abs(funding_rate) * 10000,   # 资金费率(基点)
+            'oi_change': exchange.fetch_open_interest_history(symbol)[-1]['openInterestValue']  # 持仓量变化
+        }
+    except:
+        return {'price_change':0, 'funding_rate':0, 'oi_change':0}
+
+def dynamic_scoring(symbol):
+    """动态评分模型"""
+    df = fetch_ohlcv_data(symbol)
+    if df is None or len(df) < 24:
         return None
     
-    df = calculate_indicators(df)
+    tech_factors = calculate_technical_factors(df)
+    fund_factors = get_fundamental_factors(symbol)
     
-    latest = df.iloc[-1]
-    close_price = latest["close"]
-    atr = latest["ATR"]
+    # 合成评分权重
+    score = (
+        tech_factors['momentum'] * 0.4 + 
+        tech_factors['volatility'] * 0.3 + 
+        tech_factors['volume_score'] * 0.2 +
+        fund_factors['price_change'] * 0.15 -
+        fund_factors['funding_rate'] * 0.25 +
+        np.log1p(fund_factors['oi_change']) * 0.1
+    )
     
-    # 做多信号
-    long_conditions = [
-        latest["SMA_50"] > latest["SMA_200"],
-        latest["MACD"] > latest["MACD_signal"],
-        latest["RSI"] > 50,
-        latest["ADX"] > 25,
-        latest["close"] > latest["BB_lower"],
-        latest["close"] > latest["VWAP"]
-    ]
-    
-    # 做空信号
-    short_conditions = [
-        latest["SMA_50"] < latest["SMA_200"],
-        latest["MACD"] < latest["MACD_signal"],
-        latest["RSI"] < 50,
-        latest["ADX"] > 25,
-        latest["close"] < latest["BB_upper"],
-        latest["close"] < latest["VWAP"]
-    ]
+    return {
+        'symbol': symbol,
+        'score': round(score, 2),
+        'momentum': tech_factors['momentum'],
+        'volatility': tech_factors['volatility'],
+        'funding_rate': fund_factors['funding_rate']
+    }
 
-    if all(long_conditions):
-        return {
-            "symbol": symbol,
-            "side": "做多",
-            "entry": close_price,
-            "stop_loss": close_price - 2 * atr,
-            "take_profit": close_price + 4 * atr
+def generate_strategy():
+    """生成Top3币种策略"""
+    contracts = get_all_contracts()
+    ranked_coins = []
+    
+    for symbol in contracts:
+        result = dynamic_scoring(symbol)
+        if result and not np.isnan(result['score']):
+            ranked_coins.append(result)
+    
+    # 按评分降序排列
+    ranked_coins = sorted(ranked_coins, key=lambda x: x['score'], reverse=True)[:3]
+    
+    # 生成策略报告
+    report = {
+        'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        'top3_coins': ranked_coins,
+        'strategy_advice': {
+            'momentum_strategy': "当短期动量>5%时开多仓，<-3%时平仓",
+            'volatility_control': "波动率>15%的币种使用1%止损策略",
+            'funding_arbitrage': "资金费率>30基点的币种建议反向操作"
         }
-    elif all(short_conditions):
-        return {
-            "symbol": symbol,
-            "side": "做空",
-            "entry": close_price,
-            "stop_loss": close_price + 2 * atr,
-            "take_profit": close_price - 4 * atr
-        }
+    }
     
-    return None
-
-# 获取 OKX 可交易合约列表
-def get_okx_contracts():
-    try:
-        url = "https://www.okx.com/api/v5/public/instruments?instType=SWAP"
-        response = requests.get(url)
-        data = response.json()
-        
-        if "data" in data:
-            return [item["instId"] for item in data["data"]]
-        else:
-            logger.warning("获取 OKX 合约列表失败")
-            return []
-    except Exception as e:
-        logger.error(f"获取 OKX 合约列表时发生错误: {e}")
-        return []
-
-# 运行策略，选择最佳 3 个交易标的
-def run_strategy():
-    contracts = get_okx_contracts()
-    potential_trades = []
-
-    for symbol in contracts[:20]:  
-        trade_info = filter_trading_opportunities(symbol)
-        if trade_info:
-            potential_trades.append(trade_info)
-
-    if potential_trades:
-        message = "📊 **OKX 合约交易策略** 📊\n"
-        for trade in potential_trades[:3]:
-            message += f"🔹 交易对: {trade['symbol']}\n"
-            message += f"📈 方向: {trade['side']}\n"
-            message += f"🎯 进场价格: {trade['entry']:.2f}\n"
-            message += f"⛔ 止损: {trade['stop_loss']:.2f}\n"
-            message += f"🎯 止盈: {trade['take_profit']:.2f}\n\n"
-
-        # 将策略输出记录到日志文件
-        logger.info(message)
-    else:
-        logger.info("当前市场无符合策略的合约交易机会")
-
-# 每 1 分钟运行一次
-schedule.every(1).minutes.do(run_strategy)
+    return report
 
 if __name__ == "__main__":
-    logger.info("OKX 合约交易策略机器人启动...")
-    while True:
-        schedule.run_pending()
-        time.sleep(1)
+    strategy = generate_strategy()
+    print("=== OKX合约动态策略报告 ===")
+    print(f"生成时间: {strategy['timestamp']}")
+    print("\n推荐币种:")
+    for coin in strategy['top3_coins']:
+        print(f"{coin['symbol']} | 综合评分: {coin['score']} | 动量: {coin['momentum']:.2f}% | 波动率: {coin['volatility']:.2f}% | 资金费率: {coin['funding_rate']}基点")
+    print("\n策略建议:")
+    for k, v in strategy['strategy_advice'].items():
+        print(f"- {k}: {v}")
